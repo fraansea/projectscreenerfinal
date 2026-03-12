@@ -1,0 +1,52 @@
+.app-noise::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0.03;
+    background-image: radial-gradient(#0f172a 0.45px, transparent 0.45px);
+    background-size: 6px 6px;
+    z-index: 0;
+}
+
+.premium-shell {
+    border-radius: 2rem;
+    border: 1px solid rgba(15, 23, 42, 0.08);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(250, 250, 250, 0.95));
+    box-shadow: 0 30px 70px rgba(15, 23, 42, 0.08);
+}
+
+.premium-card {
+    border-radius: 1.5rem;
+    border: 1px solid rgba(15, 23, 42, 0.09);
+    background: rgba(255, 255, 255, 0.82);
+    box-shadow: 0 10px 30px rgba(15, 23, 42, 0.05);
+}
+
+.premium-soft {
+    border-radius: 1.25rem;
+    border: 1px solid rgba(15, 23, 42, 0.08);
+    background: rgba(245, 245, 245, 0.8);
+}
+
+.accent-orange {
+    color: #eb6a45;
+}
+
+.bg-accent-orange {
+    background-color: #eb6a45;
+}
+
+.score-count {
+    font-variant-numeric: tabular-nums;
+}
+
+.soft-scrollbar::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+.soft-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(15, 23, 42, 0.2);
+    border-radius: 9999px;
+}

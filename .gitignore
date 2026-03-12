@@ -1,0 +1,67 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Environment / secrets (NEVER commit these)
+.env
+.env.*
+*.env
+backend/.env
+frontend/.env
+
+# Build outputs
+/build
+dist/
+.next/
+out/
+*.tsbuildinfo
+
+# Test coverage
+/coverage
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.pem
+
+# Caches
+.cache/
+frontend/node_modules/.cache/
+.yarn/install-state.gz
+
+# Archives & large assets
+**/*.zip
+**/*.tar.gz
+**/*.tar
+**/*.tgz
+*.pack
+*.deb
+*.dylib
+
+# Yarn
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# Misc
+chainlit.md
+.chainlit
+.vercel
+dump.rdb

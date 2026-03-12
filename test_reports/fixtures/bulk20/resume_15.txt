@@ -1,0 +1,6 @@
+Alice Doe
+Python FastAPI React AWS Docker
+5 years of experience
+Bachelor degree
+https://github.com/octocat
+https://linkedin.com/in/alice-doe

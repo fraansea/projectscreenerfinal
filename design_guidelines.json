@@ -1,0 +1,167 @@
+{
+  "identity": {
+    "name": "E1",
+    "mission": "Create a 'Swiss Utility' design that blends the precision of recruitment data with the clarity of Swiss design. Avoid generic dashboard templates.",
+    "principles": [
+      "Fusion: Swiss Typography + High-Density Data Utility",
+      "Emotion: Trust, Precision, Efficiency",
+      "Content: Data is the hero. Fit scores and skills must pop.",
+      "Negative Space: Use whitespace to separate candidates, not just lines.",
+      "Contrast: High contrast for readability. Black text on white, not gray on gray."
+    ]
+  },
+  "theme": {
+    "name": "Swiss Utility",
+    "mode": "light",
+    "strategy": "Light mode base for paper-like readability of resumes. Optional dark mode for power users.",
+    "archetype": "ARCHETYPE 4: SWISS & HIGH-CONTRAST (Softened)",
+    "visual_enhancers": [
+      "Subtle Noise Texture (opacity 0.03) on backgrounds to kill digital flatness",
+      "1px Borders with 10% opacity for structure",
+      "No Shadows on cards, only on hover (lift effect)"
+    ]
+  },
+  "typography": {
+    "headings": {
+      "family": "Outfit",
+      "weights": ["500", "600", "700"],
+      "usage": "Headings, Big Metrics, Percentages"
+    },
+    "body": {
+      "family": "Manrope",
+      "weights": ["400", "500"],
+      "usage": "General text, Resume content, Labels"
+    },
+    "mono": {
+      "family": "JetBrains Mono",
+      "weights": ["400"],
+      "usage": "Tags, Code snippets, IDs, File names"
+    }
+  },
+  "colors": {
+    "primary": {
+      "name": "Deep Royal Blue",
+      "hex": "#0F172A",
+      "usage": "Primary buttons, Active states, Strong Headers"
+    },
+    "accent": {
+      "name": "Vibrant Azure",
+      "hex": "#3B82F6",
+      "usage": "Links, Focus rings, Progress bars"
+    },
+    "neutral": {
+      "bg_main": "#FFFFFF",
+      "bg_secondary": "#F8FAFC",
+      "border": "#E2E8F0",
+      "text_main": "#0F172A",
+      "text_muted": "#64748B"
+    },
+    "semantic": {
+      "success": "#10B981",
+      "warning": "#F59E0B",
+      "error": "#EF4444",
+      "info": "#3B82F6"
+    },
+    "tiers": {
+      "top": "#10B981", 
+      "mid": "#F59E0B",
+      "low": "#EF4444"
+    }
+  },
+  "layout_strategy": {
+    "global": "Mobile-first responsive. Max-width 1440px for dashboard.",
+    "grid_system": "Bento Grid for Analytics (12-col). Dense Table for Resume List.",
+    "spacing": "Generous padding (p-6, p-8) for containers. Tight gap (gap-2, gap-4) for data points."
+  },
+  "components": {
+    "UploadZone": {
+      "style": "Technical, dashed border (border-dashed border-2).",
+      "interaction": "Scale up slightly on drag over. Turns Blue on active.",
+      "content": "Icon + 'Drop Resumes (ZIP)' + 'Parsing PDF/DOCX'"
+    },
+    "ResumeCard": {
+      "style": "Flat, 1px border. No shadow default. Hover: Shadow-md + Translate-y-1.",
+      "layout": "Flex row. Left: Avatar + Name. Right: Fit Score Badge + Action.",
+      "details": "Expandable accordion for skills analysis."
+    },
+    "ScoreBadge": {
+      "style": "Pill shape. Background opacity 10%. Text 100%.",
+      "variants": ["Green (80%+)", "Yellow (60-79%)", "Red (<60%)"]
+    },
+    "SkillTag": {
+      "style": "Small, rounded-md. bg-secondary text-secondary-foreground. Font-mono text-xs.",
+      "state": "Green text if matched, Gray if missing."
+    }
+  },
+  "motion": {
+    "library": "framer-motion",
+    "animations": [
+      {
+        "name": "Staggered List",
+        "description": "Candidates appear one by one with a slide-up fade effect.",
+        "props": "initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, staggerChildren: 0.05 }}"
+      },
+      {
+        "name": "Score Countup",
+        "description": "Fit score number counts up from 0 to actual score.",
+        "usage": "On result load."
+      }
+    ]
+  },
+  "assets": {
+    "images": [
+      {
+        "category": "avatars",
+        "urls": [
+          "https://images.unsplash.com/photo-1589220286904-3dcef62c68ee?crop=entropy&cs=srgb&fm=jpg&q=85",
+          "https://images.unsplash.com/photo-1575299833801-85ce40813bac?crop=entropy&cs=srgb&fm=jpg&q=85"
+        ],
+        "usage": "Candidate profile pictures"
+      },
+      {
+        "category": "abstract",
+        "urls": [
+          "https://images.unsplash.com/photo-1761481755390-83999d790b95?crop=entropy&cs=srgb&fm=jpg&q=85",
+          "https://images.unsplash.com/photo-1769548140010-a68eb02d8f46?crop=entropy&cs=srgb&fm=jpg&q=85"
+        ],
+        "usage": "Background for login or processing state"
+      }
+    ],
+    "icons": {
+      "library": "lucide-react",
+      "style": "Stroke width 1.5px (Thin/Elegant). Size 16px-20px for UI, 24px for Nav."
+    }
+  },
+  "accessibility": {
+    "contrast": "Ensure 4.5:1 ratio for text. Use 'text-slate-900' on white.",
+    "focus": "Visible focus rings (ring-2 ring-blue-500) on all interactive elements.",
+    "aria": "All icon-only buttons must have aria-label."
+  },
+  "instructions_to_main_agent": [
+    "1. Install dependencies: `yarn add framer-motion lucide-react clsx tailwind-merge recharts @radix-ui/react-slot @radix-ui/react-progress`",
+    "2. Setup Tailwind colors in `tailwind.config.js` to match the 'Swiss Utility' palette.",
+    "3. Create the `UploadZone` component first - it's the entry point.",
+    "4. Build the `ResultsTable` using a clean `table` or `grid` layout. Avoid complex DataTables if simple mapping works.",
+    "5. Use `recharts` for the Analytics dashboard (Bar chart for scores, Pie for skills).",
+    "6. Ensure the 'Processing' state is visually interesting (use the Abstract image + a progress bar).",
+    "7. Mock data should be realistic (Python Dev, Data Scientist roles).",
+    "8. DO NOT ASK USER FOR CLARIFICATION. JUST BUILD."
+  ],
+  "universal_guidelines": [
+    "Dark colors look good when used independently without gradients.",
+    "Don't make generic centered layouts.",
+    "Create depth through layered design elements.",
+    "Use glass-morphism effects with backdrop filters (12-24px blur).",
+    "MUST NOT apply universal transition (transition: all).",
+    "MUST NOT center align the app container.",
+    "Always use modern button styles (pill or sharp).",
+    "NEVER use AI assistant Emoji characters.",
+    "Every interaction needs micro-animations.",
+    "Use 2-3x more spacing than feels comfortable.",
+    "Subtle grain textures and noise overlays.",
+    "Components MUST use named exports.",
+    "Pages MUST use default exports.",
+    "Use sonner for toasts.",
+    "All interactive elements MUST include data-testid attribute."
+  ]
+}
