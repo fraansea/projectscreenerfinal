@@ -93,3 +93,19 @@ export const getScreeningBatches = async (token) => {
   });
   return data;
 };
+
+export const sendEmail = async ({ to, subject, body, cc, bcc, template_type, candidate_id, candidate_name }, token) => {
+  const { data } = await axios.post(
+    `${API_BASE}/email/send`,
+    { to, subject, body, cc, bcc, template_type, candidate_id, candidate_name },
+    { headers: withAuth(token) }
+  );
+  return data;
+};
+
+export const getEmailHistory = async (token) => {
+  const { data } = await axios.get(`${API_BASE}/email/history`, {
+    headers: withAuth(token),
+  });
+  return data;
+};

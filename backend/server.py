@@ -58,6 +58,9 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 auth_bearer = HTTPBearer(auto_error=False)
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+PROXYCURL_API_KEY = os.environ.get("PROXYCURL_API_KEY", "")
+LINKEDIN_LI_AT = os.environ.get("LINKEDIN_LI_AT", "")
+LINKEDIN_JSESSIONID = os.environ.get("LINKEDIN_JSESSIONID", "")
 GITHUB_CLIENT = (
     Github(auth=Auth.Token(GITHUB_TOKEN), per_page=20)
     if GITHUB_TOKEN
@@ -379,6 +382,15 @@ class TrustScore(BaseModel):
     flags: List[str] = Field(default_factory=list)
 
 
+class VerificationSummary(BaseModel):
+    score: int = 0
+    checks_passed: int = 0
+    checks_total: int = 5
+    checks: List[str] = Field(default_factory=list)
+    status: str = "Review Required"
+    badge_color: str = "red"
+
+
 class InterviewQuestions(BaseModel):
     questions: List[str] = Field(default_factory=list)
     generated_by: str = "rule-based"
@@ -395,9 +407,27 @@ class ResumeAdvice(BaseModel):
     priority_fix: str = ""
 
 
+class NotableAchievement(BaseModel):
+    title: str
+    achievement_type: str  # "github" | "hackathon" | "certification" | "linkedin" | "portfolio"
+    score: float = 0.0
+    stars: int = 0
+    forks: int = 0
+    deployed_url: Optional[str] = None
+    url: Optional[str] = None
+    description: str = ""
+    medal: str = "🥉"
+
+
+class NotableAchievements(BaseModel):
+    top_achievements: List[NotableAchievement] = Field(default_factory=list)
+    total_found: int = 0
+
+
 class CandidateResult(BaseModel):
     candidate_id: str
     candidate_name: str
+    candidate_email: Optional[str] = None
     source_file: str
     fit_score: float
     tier: str
@@ -415,9 +445,13 @@ class CandidateResult(BaseModel):
     bias_flags: BiasFlags = Field(default_factory=BiasFlags)
     career_trajectory: CareerTrajectory = Field(default_factory=CareerTrajectory)
     trust_score: TrustScore = Field(default_factory=TrustScore)
+    verification_summary: VerificationSummary = Field(
+        default_factory=VerificationSummary
+    )
     interview_questions: InterviewQuestions = Field(default_factory=InterviewQuestions)
     email_template: EmailTemplates = Field(default_factory=EmailTemplates)
     resume_advice: ResumeAdvice = Field(default_factory=ResumeAdvice)
+    notable_achievements: NotableAchievements = Field(default_factory=NotableAchievements)
 
 
 class SkillCoverage(BaseModel):
@@ -798,10 +832,24 @@ def extract_github_username(url: str) -> Optional[str]:
     return username
 
 
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
+
 def safe_url_scan(url: str) -> Dict[str, Any]:
-    headers = {"User-Agent": "resume-screener-app/1.0"}
     try:
-        response = requests.get(url, timeout=2, allow_redirects=True, headers=headers)
+        response = requests.get(
+            url, timeout=4, allow_redirects=True, headers=_BROWSER_HEADERS
+        )
         reachable = response.status_code < 400 or response.status_code in {401, 403, 429, 999}
         return {
             "reachable": reachable,
@@ -1097,117 +1145,483 @@ def extract_linkedin_connections(text: str) -> int:
     return 0
 
 
-def verify_linkedin_portfolio(
-    url: Optional[str], jd_required_skills: List[str], jd_nice_to_have: List[str]
-) -> LinkedInPortfolioAnalysis:
-    if not url:
-        return LinkedInPortfolioAnalysis(notes="No LinkedIn profile detected")
-
-    if not re.search(r"linkedin\.com/(in|pub|company)/", url):
-        return LinkedInPortfolioAnalysis(profile_url=url, notes="Invalid LinkedIn URL format")
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept-Language": "en-US,en;q=0.8",
-    }
-
+def _proxycurl_fetch_linkedin(url: str) -> Optional[Dict[str, Any]]:
+    """
+    Call Proxycurl Person Profile API.
+    Returns the raw profile dict on success, None if unavailable/unconfigured.
+    Free tier: 10 credits at https://nubela.co/proxycurl
+    """
+    if not PROXYCURL_API_KEY:
+        return None
     try:
-        response = requests.get(url, headers=headers, timeout=4, allow_redirects=True)
-    except Exception:
-        return LinkedInPortfolioAnalysis(profile_url=url, notes="Unable to reach LinkedIn profile")
+        resp = requests.get(
+            "https://nubela.co/proxycurl/api/v2/linkedin",
+            params={
+                "linkedin_profile_url": url,
+                "use_cache": "if-present",   # free — reuse cached data if already fetched
+                "skills": "include",
+                "extra": "include",
+            },
+            headers={"Authorization": f"Bearer {PROXYCURL_API_KEY}"},
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("full_name") or data.get("headline"):
+                logger.info("Proxycurl LinkedIn data fetched for %s", url)
+                return data
+        elif resp.status_code == 404:
+            logger.info("Proxycurl: LinkedIn profile not found: %s", url)
+        elif resp.status_code == 401:
+            logger.warning("Proxycurl: invalid API key")
+        elif resp.status_code == 429:
+            logger.warning("Proxycurl: rate limit / credits exhausted")
+        else:
+            logger.warning("Proxycurl returned %s for %s", resp.status_code, url)
+    except Exception as exc:
+        logger.warning("Proxycurl request failed: %s", exc)
+    return None
 
-    if response.status_code >= 400 and response.status_code not in {401, 403, 429, 999}:
-        return LinkedInPortfolioAnalysis(profile_url=url, notes="LinkedIn profile unavailable")
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    page_title = normalize_text(soup.title.text) if soup.title and soup.title.text else ""
-    meta_desc = soup.find("meta", attrs={"name": "description"})
-    description = normalize_text(meta_desc.get("content", "")) if meta_desc else ""
-    text_blob = normalize_text(soup.get_text(" ", strip=True)).lower()
+def _proxycurl_to_linkedin_analysis(
+    data: Dict[str, Any],
+    url: str,
+    jd_required_skills: List[str],
+    jd_nice_to_have: List[str],
+) -> LinkedInPortfolioAnalysis:
+    """Convert Proxycurl API response to LinkedInPortfolioAnalysis."""
+    jd_terms = sorted(set([*jd_required_skills, *jd_nice_to_have]))
 
-    jd_terms = sorted(list(set([*jd_required_skills, *jd_nice_to_have])))
-    jd_keywords_found = [term for term in jd_terms if term.lower() in text_blob]
-    projects_found = len(re.findall(r"\bproject(s)?\b", text_blob))
-    connections_count = extract_linkedin_connections(text_blob)
-    total_experience_years = extract_experience_years(text_blob)
-    premium_detected = "premium" in text_blob
+    # Skills from Proxycurl
+    profile_skills = [s.get("name", "").lower() for s in (data.get("skills") or [])]
+    jd_keywords_found = [t for t in jd_terms if t.lower() in profile_skills
+                         or t.lower() in (data.get("summary") or "").lower()
+                         or t.lower() in (data.get("headline") or "").lower()]
 
-    # Extract achievements from LinkedIn public page text
-    _ACHIEVEMENT_MARKERS = [
-        "award", "achievement", "honor", "prize", "winner", "recognition",
-        "best paper", "hackathon", "rank 1", "first place", "gold medal",
-        "published", "speaker", "keynote", "patent", "scholarship", "fellowship",
-        "dean's list", "cum laude", "distinction", "merit",
-    ]
-    achievements: List[str] = []
-    for line in response.text.splitlines():
-        line_clean = normalize_text(line)
-        line_lower = line_clean.lower()
-        if any(marker in line_lower for marker in _ACHIEVEMENT_MARKERS):
-            if 15 < len(line_clean) < 180:
-                achievements.append(line_clean)
-    achievements = list(dict.fromkeys(achievements))[:8]
+    # Experience years from roles
+    experiences = data.get("experiences") or []
+    total_exp_years = 0
+    for exp in experiences:
+        starts_at = exp.get("starts_at") or {}
+        ends_at = exp.get("ends_at") or {}
+        start_year = starts_at.get("year")
+        end_year = ends_at.get("year") or datetime.now().year
+        if start_year:
+            total_exp_years += max(0, end_year - start_year)
 
-    # Extract certification names
-    _CERT_MARKERS = [
-        "certified", "certification", "certificate", "aws certified",
-        "google certified", "microsoft certified", "pmp", "cpa", "cfa",
-        "comptia", "cisco", "oracle certified", "scrum master", "coursera",
-        "udemy", "linkedin learning", "pluralsight",
-    ]
-    certifications: List[str] = []
-    for line in response.text.splitlines():
-        line_clean = normalize_text(line)
-        line_lower = line_clean.lower()
-        if any(marker in line_lower for marker in _CERT_MARKERS):
-            if 10 < len(line_clean) < 150:
-                certifications.append(line_clean)
-    certifications = list(dict.fromkeys(certifications))[:6]
+    # Achievements from honors
+    achievements = [
+        h.get("title", "") for h in (data.get("accomplishment_honors_awards") or [])
+        if h.get("title")
+    ][:8]
 
-    # Extract project title hints from meta / h1-h3 tags
-    project_titles: List[str] = []
-    for tag in soup.find_all(["h1", "h2", "h3", "h4"]):
-        text_val = normalize_text(tag.get_text())
-        if 8 < len(text_val) < 100 and "project" in text_val.lower():
-            project_titles.append(text_val)
-    project_titles = list(dict.fromkeys(project_titles))[:5]
+    # Certifications
+    certifications = [
+        c.get("name", "") for c in (data.get("certifications") or [])
+        if c.get("name")
+    ][:6]
 
-    linkedin_score = 0.0
-    if projects_found > 0:
-        linkedin_score += 8
-    if jd_keywords_found:
-        linkedin_score += 10
-    if connections_count >= 500:
-        linkedin_score += 5
-    if premium_detected:
-        linkedin_score += 3
-    if achievements:
-        linkedin_score += 7
-    if certifications:
-        linkedin_score += 5
+    # Project titles
+    project_titles = [
+        p.get("title", "") for p in (data.get("accomplishment_projects") or [])
+        if p.get("title")
+    ][:5]
+    projects_found = len(project_titles) or len(data.get("accomplishment_projects") or [])
+
+    # Connections
+    connections = data.get("connections") or 0
+
+    # Score
+    score = 0.0
+    if jd_keywords_found:       score += 10
+    if projects_found > 0:      score += 8
+    if achievements:            score += 7
+    if certifications:          score += 5
+    if connections >= 500:      score += 5
+    if total_exp_years >= 2:    score += 3
+    if data.get("summary"):     score += 2
+
+    headline = data.get("headline") or data.get("occupation") or ""
+    current_title = ""
+    if experiences:
+        current_title = experiences[0].get("title") or ""
 
     return LinkedInPortfolioAnalysis(
         verified=True,
         profile_url=url,
-        headline=description or page_title,
-        current_title=page_title,
-        total_experience_years=total_experience_years,
+        headline=headline,
+        current_title=current_title,
+        total_experience_years=min(int(total_exp_years), 40),
         projects_found=projects_found,
         jd_keywords_found=jd_keywords_found,
-        connections_count=connections_count,
-        premium_detected=premium_detected,
-        verification_score=round(linkedin_score, 2),
-        notes="LinkedIn profile analyzed from public content",
+        connections_count=connections,
+        premium_detected=False,
+        verification_score=round(score, 2),
+        notes=f"Full LinkedIn profile via Proxycurl API · {len(profile_skills)} skills",
         achievements=achievements,
         certifications=certifications,
         project_titles=project_titles,
     )
 
 
+async def _playwright_scrape_linkedin(url: str) -> Optional[Dict[str, Any]]:
+    """
+    Playwright-based LinkedIn scraper for college/dev use.
+    Uses li_at session cookie to bypass authwall.
+    Returns structured profile dict or None on failure.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        logger.warning("Playwright not installed — run: pip install playwright && playwright install chromium")
+        return None
+
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
+                ],
+            )
+
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+                timezone_id="America/New_York",
+            )
+
+            # Inject LinkedIn session cookies if available
+            cookies = []
+            if LINKEDIN_LI_AT:
+                cookies.append({
+                    "name": "li_at",
+                    "value": LINKEDIN_LI_AT,
+                    "domain": ".linkedin.com",
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                })
+            if LINKEDIN_JSESSIONID:
+                jsessionid = LINKEDIN_JSESSIONID.strip('"')
+                cookies.append({
+                    "name": "JSESSIONID",
+                    "value": f'"{jsessionid}"' if not jsessionid.startswith('"') else jsessionid,
+                    "domain": ".linkedin.com",
+                    "path": "/",
+                    "httpOnly": False,
+                    "secure": True,
+                })
+            if cookies:
+                await context.add_cookies(cookies)
+
+            page = await context.new_page()
+
+            # Block images/fonts/media to speed up loading
+            await page.route(
+                "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,mp4,mp3}",
+                lambda route: route.abort(),
+            )
+
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=10000)
+                await page.wait_for_timeout(1000)
+            except Exception as nav_err:
+                logger.warning("Playwright navigation failed for %s: %s", url, nav_err)
+                await browser.close()
+                return None
+
+            current_url = page.url
+            # Detect authwall / login redirect
+            if any(k in current_url for k in ("authwall", "/login", "checkpoint", "uas/login")):
+                logger.info(
+                    "LinkedIn authwall hit for %s. "
+                    "Set LINKEDIN_LI_AT cookie in backend/.env to bypass.",
+                    url,
+                )
+                await browser.close()
+                return {"_blocked": True, "profile_url": url}
+
+            # ── Extract profile data ──────────────────────────────────────────
+            data: Dict[str, Any] = {"profile_url": url, "_blocked": False}
+
+            # Name / headline
+            for sel, key in [
+                ("h1", "full_name"),
+                (".text-body-medium.break-words", "headline"),
+                (".pv-text-details__left-panel .text-body-small", "location"),
+            ]:
+                try:
+                    el = page.locator(sel).first
+                    text = (await el.inner_text(timeout=2000)).strip()
+                    if text:
+                        data[key] = text
+                except Exception:
+                    pass
+
+            # About / summary
+            try:
+                about = page.locator(".core-section-container.summary .core-section-container__content").first
+                data["summary"] = (await about.inner_text(timeout=2000)).strip()
+            except Exception:
+                pass
+
+            # Skills section
+            skills: List[str] = []
+            try:
+                skill_items = page.locator(".pv-skill-category-entity__name span[aria-hidden='true']")
+                count = await skill_items.count()
+                for i in range(min(count, 20)):
+                    sk = (await skill_items.nth(i).inner_text(timeout=1000)).strip()
+                    if sk:
+                        skills.append(sk)
+            except Exception:
+                pass
+            data["skills"] = skills
+
+            # Experience section
+            experiences: List[Dict] = []
+            try:
+                exp_items = page.locator(".experience-section li, .pvs-list__item--line-separated")
+                count = await exp_items.count()
+                for i in range(min(count, 5)):
+                    try:
+                        item_text = (await exp_items.nth(i).inner_text(timeout=1000)).strip()
+                        if item_text and len(item_text) > 3:
+                            experiences.append({"title": item_text.split("\n")[0]})
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            data["experiences"] = experiences
+
+            # Certifications
+            certifications: List[str] = []
+            try:
+                cert_section = page.locator(".certifications-section .pv-certification-entity__summary-info")
+                count = await cert_section.count()
+                for i in range(min(count, 6)):
+                    try:
+                        cert_name = await cert_section.nth(i).locator("h3").inner_text(timeout=1000)
+                        if cert_name.strip():
+                            certifications.append(cert_name.strip())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            data["certifications"] = certifications
+
+            # Connections count from meta text
+            try:
+                conn_el = page.locator(".pv-top-card--list .pv-top-card--list-bullet li span").first
+                conn_text = (await conn_el.inner_text(timeout=1500)).strip()
+                m = re.search(r"(\d[\d,]+)\+?", conn_text)
+                if m:
+                    data["connections"] = int(m.group(1).replace(",", ""))
+            except Exception:
+                data["connections"] = 0
+
+            # Get full page text for keyword matching
+            try:
+                data["_page_text"] = await page.inner_text("body")
+            except Exception:
+                data["_page_text"] = ""
+
+            await browser.close()
+            logger.info("Playwright LinkedIn scrape OK for %s — name=%s", url, data.get("full_name", "?"))
+            return data
+
+    except Exception as exc:
+        logger.error("Playwright LinkedIn scraper error: %s", exc)
+        return None
+
+
+def _playwright_data_to_analysis(
+    data: Dict[str, Any],
+    url: str,
+    jd_required_skills: List[str],
+    jd_nice_to_have: List[str],
+) -> LinkedInPortfolioAnalysis:
+    """Convert Playwright-scraped LinkedIn data to LinkedInPortfolioAnalysis."""
+    jd_terms = sorted(set([*jd_required_skills, *jd_nice_to_have]))
+    page_text = (data.get("_page_text") or "").lower()
+
+    # JD keyword matching against page text + skills
+    profile_skills_lower = [s.lower() for s in (data.get("skills") or [])]
+    jd_keywords_found = [
+        t for t in jd_terms
+        if t.lower() in page_text or t.lower() in profile_skills_lower
+    ]
+
+    # Experience years — rough estimate from page text
+    total_experience_years = extract_experience_years(page_text)
+
+    # Certifications
+    certifications = [c for c in (data.get("certifications") or []) if c][:6]
+
+    # Skills
+    skills = data.get("skills") or []
+
+    # Connections
+    connections = int(data.get("connections") or 0)
+
+    # Projects mentioned in page text
+    projects_found = len(re.findall(r"\bproject(s)?\b", page_text))
+
+    # Score
+    score = 0.0
+    if jd_keywords_found:        score += 10
+    if projects_found > 0:       score += 8
+    if certifications:           score += 5
+    if connections >= 500:       score += 5
+    if total_experience_years >= 2: score += 3
+    if data.get("summary"):      score += 2
+    if skills:                   score += 3
+
+    cookie_note = "✅ Scraped with session cookie" if LINKEDIN_LI_AT else "⚠️ Scraped without cookie (partial)"
+
+    return LinkedInPortfolioAnalysis(
+        verified=True,
+        profile_url=url,
+        headline=data.get("headline") or data.get("full_name") or "",
+        current_title=(data.get("experiences") or [{}])[0].get("title", ""),
+        total_experience_years=total_experience_years,
+        projects_found=projects_found,
+        jd_keywords_found=jd_keywords_found,
+        connections_count=connections,
+        verification_score=round(score, 2),
+        notes=f"LinkedIn scraped via Playwright · {cookie_note} · {len(skills)} skills found",
+        certifications=certifications,
+        project_titles=[e.get("title", "") for e in (data.get("experiences") or [])[:5]],
+    )
+
+
+def verify_linkedin_portfolio(
+    url: Optional[str], jd_required_skills: List[str], jd_nice_to_have: List[str]
+) -> LinkedInPortfolioAnalysis:
+    """
+    3-layer LinkedIn verification pipeline:
+      Layer 1: Proxycurl API  — real structured data (requires PROXYCURL_API_KEY)
+      Layer 2: Public HTML    — limited data from public page (often blocked by LinkedIn)
+      Layer 3: Format check   — URL validity only, recruiter clicks to review manually
+    """
+    if not url:
+        return LinkedInPortfolioAnalysis(notes="No LinkedIn profile detected")
+
+    if not re.search(r"linkedin\.com/(in|pub|company)/", url):
+        return LinkedInPortfolioAnalysis(profile_url=url, notes="Invalid LinkedIn URL format")
+
+    # ── Layer 1: Proxycurl API (if key configured) ───────────────────────────
+    proxycurl_data = _proxycurl_fetch_linkedin(url)
+    if proxycurl_data:
+        return _proxycurl_to_linkedin_analysis(
+            proxycurl_data, url, jd_required_skills, jd_nice_to_have
+        )
+
+    # ── Layer 1.5: Playwright browser scraper ────────────────────────────────
+    try:
+        playwright_data = asyncio.run(
+            asyncio.wait_for(_playwright_scrape_linkedin(url), timeout=18)
+        )
+    except (asyncio.TimeoutError, Exception):
+        playwright_data = None
+    if playwright_data and not playwright_data.get("_blocked"):
+        return _playwright_data_to_analysis(
+            playwright_data, url, jd_required_skills, jd_nice_to_have
+        )
+    if playwright_data and playwright_data.get("_blocked"):
+        # Authwall hit — note it clearly with cookie setup hint
+        cookie_hint = (
+            "Set LINKEDIN_LI_AT in backend/.env to bypass authwall. "
+            "Get it: Chrome → linkedin.com → DevTools (F12) → "
+            "Application → Cookies → linkedin.com → copy li_at value"
+            if not LINKEDIN_LI_AT
+            else "Authwall hit even with cookie — cookie may be expired, refresh it"
+        )
+        return LinkedInPortfolioAnalysis(
+            verified=True,
+            profile_url=url,
+            verification_score=3.0,
+            notes=f"LinkedIn URL verified · authwall blocked scraper · {cookie_hint}",
+        )
+
+    # ── Layer 2: Public HTML scrape (best-effort) ─────────────────────────────
+    li_headers = {
+        **_BROWSER_HEADERS,
+        "Referer": "https://www.google.com/",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "cross-site",
+    }
+    try:
+        response = requests.get(url, headers=li_headers, timeout=5, allow_redirects=True)
+        final_url = str(response.url)
+        blocked = (
+            response.status_code not in range(200, 400)
+            and response.status_code not in {403, 429, 999}
+        ) or any(k in final_url for k in ("authwall", "/login", "checkpoint"))
+
+        if not blocked:
+            soup = BeautifulSoup(response.text, "html.parser")
+            page_title = normalize_text(soup.title.text) if soup.title else ""
+            meta_desc = soup.find("meta", attrs={"name": "description"})
+            description = normalize_text(meta_desc.get("content", "")) if meta_desc else ""
+            text_blob = normalize_text(soup.get_text(" ", strip=True)).lower()
+
+            jd_terms = sorted(set([*jd_required_skills, *jd_nice_to_have]))
+            jd_keywords_found = [t for t in jd_terms if t.lower() in text_blob]
+            projects_found = len(re.findall(r"\bproject(s)?\b", text_blob))
+            connections_count = extract_linkedin_connections(text_blob)
+            total_experience_years = extract_experience_years(text_blob)
+
+            score = 0.0
+            if jd_keywords_found:       score += 10
+            if projects_found > 0:      score += 8
+            if connections_count >= 500: score += 5
+
+            return LinkedInPortfolioAnalysis(
+                verified=True,
+                profile_url=url,
+                headline=description or page_title,
+                current_title=page_title,
+                total_experience_years=total_experience_years,
+                projects_found=projects_found,
+                jd_keywords_found=jd_keywords_found,
+                connections_count=connections_count,
+                verification_score=round(score, 2),
+                notes="LinkedIn public page (partial data — add PROXYCURL_API_KEY for full profile)",
+            )
+    except Exception as exc:
+        logger.debug("LinkedIn public fetch failed for %s: %s", url, exc)
+
+    # ── Layer 3: Format-verified fallback ─────────────────────────────────────
+    proxycurl_hint = (
+        "Add PROXYCURL_API_KEY to backend/.env for full profile data "
+        "(free tier: https://nubela.co/proxycurl)"
+        if not PROXYCURL_API_KEY
+        else "Proxycurl returned no data for this profile"
+    )
+    return LinkedInPortfolioAnalysis(
+        verified=True,
+        profile_url=url,
+        verification_score=5.0,
+        notes=f"LinkedIn URL format verified · click to view manually · {proxycurl_hint}",
+    )
+
+
 def github_api_get_json(endpoint: str) -> Dict[str, Any]:
     headers = {
         "Accept": "application/vnd.github+json",
-        "User-Agent": "resume-screener-app/1.0",
+        "User-Agent": "PIXLS-resume-screener/1.0",
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     if GITHUB_TOKEN:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
@@ -1216,10 +1630,30 @@ def github_api_get_json(endpoint: str) -> Dict[str, Any]:
         response = requests.get(
             f"https://api.github.com{endpoint}",
             headers=headers,
-            timeout=3,
+            timeout=10,
         )
-    except Exception:
-        return {"ok": False, "status_code": None, "data": None}
+    except Exception as exc:
+        logger.warning("GitHub API request failed (%s): %s", endpoint, exc)
+        return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
+
+    # Rate limit hit
+    if response.status_code == 403:
+        remaining = response.headers.get("X-RateLimit-Remaining", "?")
+        reset_ts = response.headers.get("X-RateLimit-Reset", "?")
+        msg = response.json().get("message", "") if response.content else ""
+        if "rate limit" in msg.lower() or remaining == "0":
+            logger.warning(
+                "GitHub API rate limit hit (remaining=%s, reset=%s). "
+                "Set GITHUB_TOKEN in backend/.env for 5000 req/hr.",
+                remaining, reset_ts,
+            )
+            return {"ok": False, "status_code": 403, "data": None,
+                    "error": "rate_limit_exceeded"}
+        return {"ok": False, "status_code": 403, "data": None, "error": msg}
+
+    if response.status_code == 401:
+        logger.warning("GitHub API: bad credentials (token invalid or expired)")
+        return {"ok": False, "status_code": 401, "data": None, "error": "bad_credentials"}
 
     if response.status_code >= 400:
         return {"ok": False, "status_code": response.status_code, "data": None}
@@ -1229,7 +1663,7 @@ def github_api_get_json(endpoint: str) -> Dict[str, Any]:
             "ok": True,
             "status_code": response.status_code,
             "data": response.json(),
-            "headers": response.headers,
+            "headers": dict(response.headers),
         }
     except Exception:
         return {"ok": False, "status_code": response.status_code, "data": None}
@@ -1378,15 +1812,21 @@ def verify_github_portfolio(
 
     profile_payload = github_api_get_json(f"/users/{username}")
     if not profile_payload.get("ok"):
+        err = profile_payload.get("error", "")
+        if err == "rate_limit_exceeded":
+            note = (
+                "GitHub API rate limit exceeded (60 req/hr unauthenticated). "
+                "Add GITHUB_TOKEN to backend/.env for 5000 req/hr — "
+                "generate one at https://github.com/settings/tokens"
+            )
+        elif err == "bad_credentials":
+            note = "GitHub token invalid or expired — update GITHUB_TOKEN in backend/.env"
+        else:
+            note = f"GitHub username not found or API error ({err or profile_payload.get('status_code', 'unknown')})"
         return {
-            "github_activity": GitHubActivity(
-                username=username,
-                notes="GitHub username not found or API limit reached",
-            ),
+            "github_activity": GitHubActivity(username=username, notes=note),
             "github_analysis": GitHubPortfolioAnalysis(
-                profile_url=github_url,
-                username=username,
-                notes="Unable to fetch GitHub profile data",
+                profile_url=github_url, username=username, notes=note
             ),
         }
 
@@ -1612,10 +2052,12 @@ def extract_resumes_from_zip(zip_bytes: bytes) -> List[Dict[str, Any]]:
                     merged_text = normalize_text(
                         f"{extracted_text} {' '.join(extracted_links)}"
                     )
-                    candidate_name = Path(file_name).stem.replace("_", " ").replace("-", " ")
+                    candidate_name = extract_candidate_name(raw_bytes, file_name, extracted_text)
+                    candidate_email = extract_candidate_email(extracted_text)
                     resumes.append(
                         {
-                            "candidate_name": candidate_name.title(),
+                            "candidate_name": candidate_name,
+                            "candidate_email": candidate_email,
                             "source_file": Path(file_name).name,
                             "text": merged_text,
                             "extracted_links": extracted_links,
@@ -1624,6 +2066,244 @@ def extract_resumes_from_zip(zip_bytes: bytes) -> List[Dict[str, Any]]:
                         }
                     )
     return resumes
+
+
+_EMAIL_REGEX = re.compile(
+    r"(?<![/\\@])"            # not preceded by /, \, or @ (avoids partial URL matches)
+    r"[a-zA-Z0-9._%+\-]{1,64}"
+    r"@"
+    r"[a-zA-Z0-9.\-]{1,253}"
+    r"\.[a-zA-Z]{2,10}"
+    r"(?![.\-@\w])",          # not followed by more domain-like chars
+    re.IGNORECASE,
+)
+
+# Common placeholder / example domains to skip
+_EMAIL_IGNORE_DOMAINS = {
+    "gmail.com", "yahoo.com", "outlook.com", "hotmail.com",  # kept — real candidates use these
+}
+_EMAIL_SKIP_PATTERNS = re.compile(
+    r"(example|sample|test|noreply|no-reply|support|info|contact|admin|foo|bar)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_candidate_email(text: str) -> Optional[str]:
+    """Return the most likely personal contact email from raw resume text.
+
+    Strategy:
+    1. Find all valid email addresses in the text.
+    2. Prefer the first one that does NOT look like a placeholder/service address.
+    3. Fall back to the very first match if all look like placeholders.
+    """
+    matches = _EMAIL_REGEX.findall(text)
+    if not matches:
+        return None
+
+    candidates: List[str] = []
+    for m in matches:
+        m = m.strip(".,;:)")
+        if not _EMAIL_SKIP_PATTERNS.search(m.split("@")[0]):
+            candidates.append(m)
+
+    return candidates[0] if candidates else matches[0].strip(".,;:)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CANDIDATE NAME EXTRACTION — 4-layer pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Words that commonly appear in resume filenames but are NOT part of the person's name
+_NAME_FILENAME_STRIP = re.compile(
+    r"[\-_]?(resume|cv|curriculum|vitae|updated|new|final|v\d|202\d|2019|2018)[\-_]?",
+    re.IGNORECASE,
+)
+
+# Tokens that indicate we've passed the name section
+_CONTACT_SIGNAL = re.compile(
+    r"@|\bphone\b|\bmobile\b|\bemail\b|\baddress\b|\blinkedin\b|\bgithub\b"
+    r"|\bportfolio\b|\bwebsite\b|\btel\b|\bfax\b|\+\d|\(\d{3}\)",
+    re.IGNORECASE,
+)
+
+# Reject lines that are clearly not names
+_NON_NAME_PATTERN = re.compile(
+    r"\d{4,}|http|www\.|\.com|\.io|@|summary|objective|profile|education"
+    r"|experience|skills|projects|certifications|languages|interests|hobbies",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_name(text: str) -> bool:
+    """Return True if text plausibly is a person's full name."""
+    text = text.strip()
+    if not text or len(text) < 3 or len(text) > 55:
+        return False
+    words = text.split()
+    if len(words) < 1 or len(words) > 6:
+        return False
+    if any(c.isdigit() for c in text):
+        return False
+    if re.search(r"[^a-zA-Z\s\-\'\.]", text):
+        return False
+    skip = {"resume", "curriculum", "vitae", "cv", "profile", "summary",
+            "objective", "candidate", "applicant", "contact"}
+    if text.lower().strip() in skip:
+        return False
+    # At least one word must start with uppercase (proper noun signal)
+    if not any(w[0].isupper() for w in words if w):
+        return False
+    return True
+
+
+def _name_from_pdf_fonts(raw_bytes: bytes) -> Optional[str]:
+    """Layer 1 — find the largest-font text on page 1 of a PDF."""
+    try:
+        with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+            if not pdf.pages:
+                return None
+            page = pdf.pages[0]
+            words = page.extract_words(extra_attrs=["size"])
+            if not words:
+                return None
+
+            # Find maximum font size
+            max_size = max((w.get("size") or 0) for w in words)
+            if max_size <= 0:
+                return None
+
+            # Collect words rendered at the maximum (or within 1.5 pt) font size,
+            # stopping as soon as we leave that size run
+            name_words: List[str] = []
+            for w in words:
+                size = w.get("size") or 0
+                if size >= max_size - 1.5:
+                    name_words.append(w["text"])
+                elif name_words:
+                    # First size-drop after collecting words — stop here
+                    break
+
+            candidate = " ".join(name_words).strip()
+            if _looks_like_name(candidate):
+                return candidate.title()
+    except Exception:
+        pass
+    return None
+
+
+def _name_from_text_heuristic(text: str) -> Optional[str]:
+    """Layer 2 — first clean, name-like line near the top of the document."""
+    lines = [ln.strip() for ln in text[:1200].splitlines() if ln.strip()]
+    for line in lines[:15]:
+        if _CONTACT_SIGNAL.search(line):
+            continue
+        if _NON_NAME_PATTERN.search(line):
+            continue
+        # Ignore lines with too many words (address/title) or too few (single initial)
+        words = line.split()
+        if len(words) < 2 or len(words) > 5:
+            continue
+        if _looks_like_name(line):
+            return line.title()
+    return None
+
+
+def _name_from_regex(text: str) -> Optional[str]:
+    """Layer 3 — regex patterns common in professionally formatted resumes."""
+    patterns = [
+        # Explicit "Name:" field
+        r"(?:^|\n)\s*[Nn]ame\s*[:\-]\s*([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){1,4})",
+        # Name immediately followed by email on the next line
+        r"^([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){1,4})\s*\n\s*[a-zA-Z0-9._%+\-]+@",
+        # Name immediately followed by phone
+        r"^([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){1,4})\s*\n\s*[\+\(]?\d",
+        # All-caps name (common in older resumes)
+        r"^([A-Z]{2,}(?:\s+[A-Z]{2,}){1,4})\s*\n",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text[:2500], re.MULTILINE)
+        if m:
+            raw = m.group(1).strip()
+            # Convert ALL-CAPS to Title Case
+            candidate = raw.title()
+            if _looks_like_name(candidate):
+                return candidate
+    return None
+
+
+def _name_from_groq(text: str) -> Optional[str]:
+    """Layer 4 — Groq LLM fallback (only called if other layers fail)."""
+    if not _groq_client:
+        return None
+    try:
+        resp = _groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Extract the full name of the job applicant from this resume. "
+                    "Return ONLY the name — no punctuation, no explanation.\n\n"
+                    f"{text[:1800]}"
+                ),
+            }],
+            max_tokens=15,
+            temperature=0,
+        )
+        raw = resp.choices[0].message.content.strip().strip('"\'').strip()
+        candidate = raw.title()
+        if _looks_like_name(candidate):
+            logger.info("Name extracted via Groq LLM: %s", candidate)
+            return candidate
+    except Exception as exc:
+        logger.debug("Groq name extraction failed: %s", exc)
+    return None
+
+
+def _name_from_filename(file_name: str) -> str:
+    """Layer 5 — smart filename cleanup (always succeeds)."""
+    stem = Path(file_name).stem
+    cleaned = _NAME_FILENAME_STRIP.sub(" ", stem).strip()
+    cleaned = cleaned.replace("_", " ").replace("-", " ")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned.title() if cleaned else stem.title()
+
+
+def extract_candidate_name(raw_bytes: bytes, file_name: str, text: str) -> str:
+    """
+    Multi-layer candidate name extractor.
+    Tries layers in order and returns the first confident result.
+    Always returns something (fallback to filename).
+    """
+    is_pdf = file_name.lower().endswith(".pdf")
+
+    # Layer 1: PDF font analysis (most reliable for well-formatted resumes)
+    if is_pdf and raw_bytes:
+        name = _name_from_pdf_fonts(raw_bytes)
+        if name:
+            logger.debug("Name via fonts: %s ← %s", name, file_name)
+            return name
+
+    # Layer 2: Top-of-document heuristic
+    name = _name_from_text_heuristic(text)
+    if name:
+        logger.debug("Name via heuristic: %s ← %s", name, file_name)
+        return name
+
+    # Layer 3: Regex patterns
+    name = _name_from_regex(text)
+    if name:
+        logger.debug("Name via regex: %s ← %s", name, file_name)
+        return name
+
+    # Layer 4: Groq LLM (expensive — only for edge cases)
+    name = _name_from_groq(text)
+    if name:
+        return name
+
+    # Layer 5: Filename fallback
+    name = _name_from_filename(file_name)
+    logger.debug("Name via filename fallback: %s ← %s", name, file_name)
+    return name
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1882,6 +2562,315 @@ def compute_trust_score(
     label = "High" if score >= 80 else "Medium" if score >= 60 else "Low"
     badge = "🟢" if score >= 80 else "🟡" if score >= 60 else "🔴"
     return TrustScore(score=score, label=label, badge=badge, flags=flags)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE 5a — NOTABLE ACHIEVEMENTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+_HACKATHON_PATTERNS = re.compile(
+    r"\b(hackathon|hack[\-\s]?a[\-\s]?thon|hackfest|hack\s*day|techfest|"
+    r"finalist|1st\s+place|2nd\s+place|3rd\s+place|winner|runner[\-\s]?up|"
+    r"ktu\s+fest|ieee|acm|national\s+level|state\s+level|"
+    r"smart\s*india\s*hackathon|sih|coding\s+competi|code\s+sprint|"
+    r"build[a]?thon|inno[\s\-]?fest)\b",
+    re.IGNORECASE,
+)
+
+_CERT_PATTERNS = re.compile(
+    r"\b(aws\s+certified|google\s+cloud|azure\s+certified|"
+    r"coursera|udemy|nptel|oracle\s+certified|cisco|"
+    r"certified\s+\w+\s+\w*|professional\s+certificate|"
+    r"specialization|microsoft\s+certified|meta\s+front[\-\s]?end)\b",
+    re.IGNORECASE,
+)
+
+
+def _calculate_achievement_score(ach: dict) -> float:
+    score = 0.0
+    score += ach.get("stars", 0) * 3
+    score += ach.get("forks", 0) * 2
+    if ach.get("deployed_url"):
+        score += 15
+    atype = ach.get("achievement_type", "")
+    if atype == "hackathon":
+        score += 20
+    elif atype == "certification":
+        score += 10
+    elif atype == "linkedin":
+        score += 8
+    return round(min(100.0, score), 1)
+
+
+def _medal(score: float) -> str:
+    if score >= 50:
+        return "🥇"
+    if score >= 25:
+        return "🥈"
+    return "🥉"
+
+
+def _extract_hackathons_from_text(text: str) -> List[dict]:
+    """Scan resume text for hackathon / competition mentions."""
+    items: List[dict] = []
+    seen: set = set()
+    for match in _HACKATHON_PATTERNS.finditer(text):
+        start = max(0, match.start() - 60)
+        end = min(len(text), match.end() + 60)
+        snippet = text[start:end].strip().replace("\n", " ")
+        key = match.group(0).lower()
+        if key not in seen:
+            seen.add(key)
+            items.append(
+                {
+                    "title": snippet[:80],
+                    "achievement_type": "hackathon",
+                    "stars": 0,
+                    "forks": 0,
+                    "deployed_url": None,
+                    "url": None,
+                    "description": snippet,
+                }
+            )
+    return items[:4]
+
+
+def _extract_certifications_from_text(text: str) -> List[dict]:
+    """Scan resume text for certification mentions."""
+    items: List[dict] = []
+    seen: set = set()
+    for match in _CERT_PATTERNS.finditer(text):
+        start = max(0, match.start() - 20)
+        end = min(len(text), match.end() + 60)
+        snippet = text[start:end].strip().replace("\n", " ")
+        key = match.group(0).lower()
+        if key not in seen:
+            seen.add(key)
+            items.append(
+                {
+                    "title": snippet[:80],
+                    "achievement_type": "certification",
+                    "stars": 0,
+                    "forks": 0,
+                    "deployed_url": None,
+                    "url": None,
+                    "description": snippet,
+                }
+            )
+    return items[:4]
+
+
+def analyze_notable_achievements(
+    resume_text: str,
+    github_analysis: "GitHubPortfolioAnalysis",
+    linkedin_analysis: "LinkedInPortfolioAnalysis",
+) -> "NotableAchievements":
+    """
+    Aggregate achievements from 4 sources, score, rank, return top 5.
+    Sources: GitHub repos · LinkedIn achievements/certs · Resume hackathons · Resume certifications
+    """
+    raw: List[dict] = []
+
+    # ── Source 1: GitHub top projects ──
+    for proj in github_analysis.top_projects:
+        raw.append(
+            {
+                "title": proj.repo_name,
+                "achievement_type": "github",
+                "stars": proj.stars,
+                "forks": proj.forks,
+                "deployed_url": proj.repo_url if proj.deployment_ready else None,
+                "url": proj.repo_url,
+                "description": proj.description or proj.readme_preview,
+            }
+        )
+
+    # ── Source 2: LinkedIn achievements ──
+    for ach in (linkedin_analysis.achievements or []):
+        raw.append(
+            {
+                "title": ach[:80],
+                "achievement_type": "linkedin",
+                "stars": 0,
+                "forks": 0,
+                "deployed_url": None,
+                "url": linkedin_analysis.profile_url,
+                "description": ach,
+            }
+        )
+
+    # ── Source 3: Resume – hackathons / competitions ──
+    raw.extend(_extract_hackathons_from_text(resume_text))
+
+    # ── Source 4: Resume – certifications ──
+    raw.extend(_extract_certifications_from_text(resume_text))
+
+    # Score + deduplicate (by lowercased title prefix)
+    seen_titles: set = set()
+    scored: List[dict] = []
+    for item in raw:
+        key = item["title"].lower()[:30]
+        if key in seen_titles:
+            continue
+        seen_titles.add(key)
+        item["score"] = _calculate_achievement_score(item)
+        item["medal"] = _medal(item["score"])
+        scored.append(item)
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    top5 = scored[:5]
+
+    achievements = [
+        NotableAchievement(
+            title=a["title"],
+            achievement_type=a["achievement_type"],
+            score=a["score"],
+            stars=a.get("stars", 0),
+            forks=a.get("forks", 0),
+            deployed_url=a.get("deployed_url"),
+            url=a.get("url"),
+            description=a.get("description", ""),
+            medal=a["medal"],
+        )
+        for a in top5
+    ]
+
+    return NotableAchievements(top_achievements=achievements, total_found=len(scored))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE 5b — VERIFICATION SCORE  (5-check, 100-pt algorithm)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_verification_summary(
+    resume_text: str,
+    matched_skills: List[str],
+    github_analysis: "GitHubPortfolioAnalysis",
+    linkedin_analysis: "LinkedInPortfolioAnalysis",
+    candidate_years: int,
+) -> "VerificationSummary":
+    """
+    5-check verification algorithm:
+
+    CHECK 1 – GitHub Activity        (25 pts)
+    CHECK 2 – LinkedIn Verification  (25 pts)
+    CHECK 3 – Timeline Consistency   (20 pts)
+    CHECK 4 – Skills-Projects Match  (20 pts)
+    CHECK 5 – Red-Flags / Buzzwords  (10 pts)
+    """
+    score = 0
+    checks: List[str] = []
+    text_lower = resume_text.lower()
+
+    # ── Check 1: GitHub Activity (25 pts) ──
+    if github_analysis.verified:
+        status = github_analysis.activity_status
+        if status == "Active":
+            score += 25
+            checks.append(
+                f"✅ GitHub: {github_analysis.total_public_repos} repos "
+                f"(active commits)"
+            )
+        elif status == "Recent":
+            score += 15
+            checks.append(
+                f"⚠️ GitHub: {github_analysis.total_public_repos} repos "
+                f"(recent, some inactivity)"
+            )
+        else:
+            checks.append(
+                f"❌ GitHub: {github_analysis.total_public_repos} repos "
+                f"(stale 6+ months)"
+            )
+    else:
+        checks.append("❌ GitHub: No verified profile detected")
+
+    # ── Check 2: LinkedIn Verification (25 pts) ──
+    if linkedin_analysis.verified:
+        score += 25
+        headline = linkedin_analysis.headline or "profile found"
+        checks.append(f"✅ LinkedIn: {headline[:60]}")
+    else:
+        checks.append("❌ LinkedIn: Not verified (blocked or missing)")
+
+    # ── Check 3: Timeline Consistency (20 pts) ──
+    grad_years = re.findall(
+        r"(?:graduated|batch|passed out|class of)\s*[:\-]?\s*(20\d{2}|19\d{2})",
+        text_lower,
+    )
+    work_years = re.findall(r"(20\d{2})\s*[-–]\s*(?:present|current)", text_lower)
+    timeline_ok = True
+    if grad_years and work_years:
+        try:
+            grad_year = max(int(y) for y in grad_years)
+            work_start = min(int(y) for y in work_years)
+            if work_start < grad_year - 1:
+                timeline_ok = False
+                checks.append(
+                    f"❌ Timeline: Work started ({work_start}) before graduation "
+                    f"({grad_year}) — inconsistency"
+                )
+        except Exception:
+            pass
+    if timeline_ok:
+        score += 20
+        checks.append("✅ Timeline: Dates are logically consistent")
+
+    # ── Check 4: Skills-Projects Match (20 pts) ──
+    jd_tech_in_github = github_analysis.jd_relevant_projects if github_analysis.verified else 0
+    if jd_tech_in_github >= 2:
+        score += 20
+        checks.append(
+            f"✅ Skills: {jd_tech_in_github} JD-relevant repos found"
+        )
+    elif jd_tech_in_github == 1:
+        score += 10
+        checks.append("⚠️ Skills: Only 1 JD-relevant repo found")
+    elif matched_skills:
+        score += 5
+        checks.append(
+            f"⚠️ Skills: Resume claims {len(matched_skills)} matches "
+            f"but no repos to verify"
+        )
+    else:
+        checks.append("❌ Skills: No JD-matching repos or skill claims found")
+
+    # ── Check 5: Red Flags / Buzzwords (10 pts) ──
+    words = text_lower.split()
+    word_count = max(len(words), 1)
+    buzz_count = sum(1 for bw in _BUZZWORDS_TRUST if bw in text_lower)
+    buzz_ratio = buzz_count / word_count * 100
+    if buzz_ratio < 5:
+        score += 10
+        checks.append(f"✅ Red Flags: None detected (buzzword ratio {buzz_ratio:.1f}%)")
+    else:
+        checks.append(
+            f"❌ Red Flags: High buzzword ratio ({buzz_ratio:.1f}%) — substance unclear"
+        )
+
+    score = max(0, min(100, score))
+    checks_passed = sum(1 for c in checks if c.startswith("✅"))
+    status = (
+        "Fully Verified" if score >= 90
+        else "Mostly Verified" if score >= 70
+        else "Partially Verified" if score >= 50
+        else "Review Required"
+    )
+    badge_color = (
+        "green" if score >= 90
+        else "yellow" if score >= 70
+        else "orange" if score >= 50
+        else "red"
+    )
+
+    return VerificationSummary(
+        score=score,
+        checks_passed=checks_passed,
+        checks_total=5,
+        checks=checks,
+        status=status,
+        badge_color=badge_color,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2303,180 +3292,148 @@ async def perform_analysis(
     matrix = vectorizer.fit_transform([final_jd_text] + resume_texts)
     similarity_scores = cosine_similarity(matrix[0:1], matrix[1:]).flatten()
 
-    results: List[CandidateResult] = []
+    # ── Semaphore: max 4 resumes processed simultaneously (avoids GitHub rate-limit pile-up) ──
+    _sem = asyncio.Semaphore(4)
 
-    for index, resume in enumerate(resume_documents):
-        resume_text_lower = resume["text"].lower()
+    async def _scan_one_link(url: str) -> LinkScanResult:
+        link_type = classify_link_type(url)
+        if link_type == "linkedin":
+            check = await asyncio.to_thread(verify_linkedin, url)
+            return LinkScanResult(
+                url=url, link_type=link_type,
+                reachable=check["reachable"], valid_format=check["valid"],
+                status_code=check.get("status_code"), notes=check.get("notes", ""),
+            )
+        elif link_type == "portfolio":
+            check = await asyncio.to_thread(verify_portfolio, url)
+            return LinkScanResult(
+                url=url, link_type=link_type,
+                reachable=check["reachable"], valid_format=True,
+                status_code=check.get("status_code"), notes=check.get("notes", ""),
+            )
+        else:
+            check = await asyncio.to_thread(verify_generic_link, url)
+            return LinkScanResult(
+                url=url, link_type=link_type,
+                reachable=check["reachable"],
+                valid_format=bool(extract_github_username(url)) if link_type == "github" else True,
+                status_code=check.get("status_code"), notes=check.get("notes", ""),
+            )
 
-        matched_skills = [skill for skill in required_skills if skill in resume_text_lower]
-        missing_skills = [skill for skill in required_skills if skill not in resume_text_lower]
+    async def _process_one_resume(index: int, resume: dict) -> CandidateResult:
+        async with _sem:
+            resume_text_lower = resume["text"].lower()
 
-        skills_match_score = (
-            round((len(matched_skills) / len(required_skills)) * 100, 2)
-            if required_skills
-            else round(min(100.0, similarity_scores[index] * 100), 2)
-        )
+            matched_skills = [s for s in required_skills if s in resume_text_lower]
+            missing_skills  = [s for s in required_skills if s not in resume_text_lower]
 
-        candidate_years = extract_experience_years(resume["text"])
-        candidate_education_level = extract_education_level(resume["text"])
-        experience_match_score = calculate_experience_score(candidate_years, jd_years)
-        education_match_score = calculate_education_score(
-            candidate_education_level, jd_education_level
-        )
+            skills_match_score = (
+                round((len(matched_skills) / len(required_skills)) * 100, 2)
+                if required_skills
+                else round(min(100.0, similarity_scores[index] * 100), 2)
+            )
 
-        links = unique_links(
-            [
+            candidate_years = extract_experience_years(resume["text"])
+            candidate_education_level = extract_education_level(resume["text"])
+            experience_match_score = calculate_experience_score(candidate_years, jd_years)
+            education_match_score  = calculate_education_score(candidate_education_level, jd_education_level)
+
+            links = unique_links([
                 *resume.get("extracted_links", []),
                 *extract_urls(resume["text"]),
                 *infer_social_urls_from_text(resume["text"]),
-            ]
-        )
-        github_urls = [link for link in links if classify_link_type(link) == "github"]
-        linkedin_urls = [link for link in links if classify_link_type(link) == "linkedin"]
-        portfolio_urls = [link for link in links if classify_link_type(link) == "portfolio"]
+            ])
+            github_urls   = [l for l in links if classify_link_type(l) == "github"]
+            linkedin_urls = [l for l in links if classify_link_type(l) == "linkedin"]
+            portfolio_urls = [l for l in links if classify_link_type(l) == "portfolio"]
 
-        github_url = github_urls[0] if github_urls else None
-        linkedin_url = linkedin_urls[0] if linkedin_urls else None
-        portfolio_url = portfolio_urls[0] if portfolio_urls else None
+            github_url   = github_urls[0]   if github_urls   else None
+            linkedin_url = linkedin_urls[0]  if linkedin_urls  else None
+            portfolio_url = portfolio_urls[0] if portfolio_urls else None
 
-        github_verification = await asyncio.to_thread(
-            verify_github_portfolio,
-            github_url,
-            required_skills,
-            nice_to_have_skills,
-        )
-        github_activity = github_verification["github_activity"]
-        github_analysis = github_verification["github_analysis"]
+            # ── Parallel: GitHub API + LinkedIn scraper + all link scans ──────
+            gh_task  = asyncio.to_thread(verify_github_portfolio,  github_url,  required_skills, nice_to_have_skills)
+            li_task  = asyncio.to_thread(verify_linkedin_portfolio, linkedin_url, required_skills, nice_to_have_skills)
+            lnk_tasks = [_scan_one_link(u) for u in links]
 
-        linkedin_analysis = await asyncio.to_thread(
-            verify_linkedin_portfolio,
-            linkedin_url,
-            required_skills,
-            nice_to_have_skills,
-        )
-        smart_portfolio = build_smart_portfolio_summary(
-            github_analysis=github_analysis,
-            linkedin_analysis=linkedin_analysis,
-        )
-
-        scanned_links: List[LinkScanResult] = []
-        linkedin_valid = False
-        linkedin_reachable = False
-        portfolio_reachable = False
-
-        for url in links:
-            link_type = classify_link_type(url)
-            if link_type == "linkedin":
-                linkedin_check = await asyncio.to_thread(verify_linkedin, url)
-                linkedin_valid = linkedin_valid or linkedin_check["valid"]
-                linkedin_reachable = linkedin_reachable or linkedin_check["reachable"]
-                scanned_links.append(
-                    LinkScanResult(
-                        url=url,
-                        link_type=link_type,
-                        reachable=linkedin_check["reachable"],
-                        valid_format=linkedin_check["valid"],
-                        status_code=linkedin_check.get("status_code"),
-                        notes=linkedin_check.get("notes", ""),
-                    )
-                )
-            elif link_type == "portfolio":
-                portfolio_check = await asyncio.to_thread(verify_portfolio, url)
-                portfolio_reachable = portfolio_reachable or portfolio_check["reachable"]
-                scanned_links.append(
-                    LinkScanResult(
-                        url=url,
-                        link_type=link_type,
-                        reachable=portfolio_check["reachable"],
-                        valid_format=True,
-                        status_code=portfolio_check.get("status_code"),
-                        notes=portfolio_check.get("notes", ""),
-                    )
-                )
-            elif link_type == "github":
-                github_check = await asyncio.to_thread(verify_generic_link, url)
-                scanned_links.append(
-                    LinkScanResult(
-                        url=url,
-                        link_type=link_type,
-                        reachable=github_check["reachable"],
-                        valid_format=bool(extract_github_username(url)),
-                        status_code=github_check.get("status_code"),
-                        notes=github_check.get("notes", ""),
-                    )
-                )
-            else:
-                generic_check = await asyncio.to_thread(verify_generic_link, url)
-                scanned_links.append(
-                    LinkScanResult(
-                        url=url,
-                        link_type=link_type,
-                        reachable=generic_check["reachable"],
-                        valid_format=True,
-                        status_code=generic_check.get("status_code"),
-                        notes=generic_check.get("notes", ""),
-                    )
-                )
-
-        activity_bonus = smart_portfolio.verification_bonus
-        if linkedin_valid and linkedin_reachable:
-            activity_bonus += 2
-        if portfolio_reachable:
-            activity_bonus += 2
-
-        activity_bonus = round(min(65.0, activity_bonus), 2)
-        similarity_score = round(float(similarity_scores[index] * 100), 2)
-
-        fit_score = round(
-            min(
-                100.0,
-                (0.45 * similarity_score)
-                + (0.30 * skills_match_score)
-                + (0.15 * experience_match_score)
-                + (0.10 * education_match_score)
-                + activity_bonus,
-            ),
-            2,
-        )
-
-        suggestions: List[str] = []
-        if missing_skills:
-            suggestions.append(f"Missing key skills: {', '.join(missing_skills[:6])}")
-        if candidate_years < jd_years and jd_years > 0:
-            suggestions.append(
-                f"Experience below requirement ({candidate_years}y vs {jd_years}y target)"
-            )
-        if not github_url:
-            suggestions.append("Add an active GitHub profile for stronger technical validation")
-        if not smart_portfolio.stack_experience_verified:
-            suggestions.append(
-                "Portfolio evidence is weak for JD stack. Add clearer project links and recent contributions."
+            github_verification, linkedin_analysis, *scanned_links_raw = await asyncio.gather(
+                gh_task, li_task, *lnk_tasks, return_exceptions=True
             )
 
-        # ── 8 new features ──────────────────────────────────────────────────
-        resume_file_bytes = resume.get("file_bytes")
-        resume_filename = resume.get("source_file", "")
+            # Unpack GitHub
+            if isinstance(github_verification, Exception):
+                github_verification = {
+                    "github_activity": GitHubActivity(notes="GitHub verification error"),
+                    "github_analysis": GitHubPortfolioAnalysis(notes="GitHub verification error"),
+                }
+            github_activity = github_verification["github_activity"]
+            github_analysis = github_verification["github_analysis"]
 
-        ats = compute_ats_score(resume["text"], resume_file_bytes, resume_filename)
-        bias = compute_bias_flags(resume["candidate_name"], resume["text"])
-        career = compute_career_trajectory(resume["text"], candidate_years)
-        trust = compute_trust_score(resume["text"], candidate_years, github_analysis)
-        interview_qs = generate_interview_questions(
-            resume["candidate_name"], matched_skills, final_jd_text
-        )
-        email_tpl = generate_email_template(
-            resume["candidate_name"], fit_score, matched_skills, missing_skills,
-            github_activity.username,
-        )
-        advice = generate_resume_advice(
-            ats, trust, career, matched_skills, missing_skills, github_analysis, fit_score
-        )
-        # ────────────────────────────────────────────────────────────────────
+            # Unpack LinkedIn
+            if isinstance(linkedin_analysis, Exception):
+                linkedin_analysis = LinkedInPortfolioAnalysis(notes="LinkedIn verification error")
 
-        results.append(
-            CandidateResult(
+            smart_portfolio = build_smart_portfolio_summary(github_analysis, linkedin_analysis)
+
+            # Unpack link scans
+            scanned_links: List[LinkScanResult] = []
+            linkedin_valid = linkedin_reachable = portfolio_reachable = False
+            for res in scanned_links_raw:
+                if isinstance(res, LinkScanResult):
+                    scanned_links.append(res)
+                    if res.link_type == "linkedin":
+                        linkedin_valid     = linkedin_valid or res.valid_format
+                        linkedin_reachable = linkedin_reachable or res.reachable
+                    elif res.link_type == "portfolio":
+                        portfolio_reachable = portfolio_reachable or res.reachable
+
+            activity_bonus = smart_portfolio.verification_bonus
+            if linkedin_valid and linkedin_reachable: activity_bonus += 2
+            if portfolio_reachable:                   activity_bonus += 2
+            activity_bonus = round(min(65.0, activity_bonus), 2)
+
+            similarity_score = round(float(similarity_scores[index] * 100), 2)
+            fit_score = round(
+                min(100.0,
+                    0.45 * similarity_score
+                    + 0.30 * skills_match_score
+                    + 0.15 * experience_match_score
+                    + 0.10 * education_match_score
+                    + activity_bonus),
+                2,
+            )
+
+            suggestions: List[str] = []
+            if missing_skills:
+                suggestions.append(f"Missing key skills: {', '.join(missing_skills[:6])}")
+            if candidate_years < jd_years and jd_years > 0:
+                suggestions.append(f"Experience below requirement ({candidate_years}y vs {jd_years}y target)")
+            if not github_url:
+                suggestions.append("Add an active GitHub profile for stronger technical validation")
+            if not smart_portfolio.stack_experience_verified:
+                suggestions.append("Portfolio evidence is weak for JD stack. Add clearer project links and recent contributions.")
+
+            resume_file_bytes = resume.get("file_bytes")
+            resume_filename   = resume.get("source_file", "")
+
+            # ── Pure-CPU features — run concurrently in threads ───────────────
+            ats_t  = asyncio.to_thread(compute_ats_score, resume["text"], resume_file_bytes, resume_filename)
+            bias_t = asyncio.to_thread(compute_bias_flags, resume["candidate_name"], resume["text"])
+            car_t  = asyncio.to_thread(compute_career_trajectory, resume["text"], candidate_years)
+            tru_t  = asyncio.to_thread(compute_trust_score, resume["text"], candidate_years, github_analysis)
+
+            ats, bias, career, trust = await asyncio.gather(ats_t, bias_t, car_t, tru_t)
+
+            achievements = analyze_notable_achievements(resume["text"], github_analysis, linkedin_analysis)
+            verification = calculate_verification_summary(resume["text"], matched_skills, github_analysis, linkedin_analysis, candidate_years)
+            interview_qs = generate_interview_questions(resume["candidate_name"], matched_skills, final_jd_text)
+            email_tpl    = generate_email_template(resume["candidate_name"], fit_score, matched_skills, missing_skills, github_activity.username)
+            advice       = generate_resume_advice(ats, trust, career, matched_skills, missing_skills, github_analysis, fit_score)
+
+            return CandidateResult(
                 candidate_id=str(uuid.uuid4()),
                 candidate_name=resume["candidate_name"],
+                candidate_email=resume.get("candidate_email"),
                 source_file=resume["source_file"],
                 fit_score=fit_score,
                 tier=classify_tier(fit_score),
@@ -2493,6 +3450,8 @@ async def perform_analysis(
                 bias_flags=bias,
                 career_trajectory=career,
                 trust_score=trust,
+                verification_summary=verification,
+                notable_achievements=achievements,
                 interview_questions=interview_qs,
                 email_template=email_tpl,
                 resume_advice=advice,
@@ -2514,7 +3473,13 @@ async def perform_analysis(
                     activity_bonus=round(activity_bonus, 2),
                 ),
             )
-        )
+
+    # ── Run all resumes in parallel ────────────────────────────────────────────
+    results_raw = await asyncio.gather(
+        *[_process_one_resume(i, r) for i, r in enumerate(resume_documents)],
+        return_exceptions=True,
+    )
+    results: List[CandidateResult] = [r for r in results_raw if isinstance(r, CandidateResult)]
 
     results.sort(key=lambda item: item.fit_score, reverse=True)
     analytics = build_analytics(results, required_skills)
@@ -2839,6 +3804,298 @@ async def export_results_csv(
         "Content-Disposition": f"attachment; filename=resume_screening_{batch_id}.csv"
     }
     return StreamingResponse(iter([csv_buffer.getvalue()]), media_type="text/csv", headers=headers)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE 9 — EMAIL SENDING (Multi-provider: SMTP → local outbox fallback)
+# ─────────────────────────────────────────────────────────────────────────────
+
+SMTP_HOST = os.environ.get("PIXLS_SMTP_HOST", "smtp.gmail.com")
+SMTP_USER = os.environ.get("PIXLS_SMTP_USER", "")
+SMTP_PASS = os.environ.get("PIXLS_SMTP_PASS", "")
+EMAIL_RATE_LIMIT = int(os.environ.get("EMAIL_RATE_LIMIT_PER_HOUR", "50"))
+
+# Local outbox directory — emails saved here when SMTP is unavailable
+_OUTBOX_DIR = ROOT_DIR / "email_outbox"
+_OUTBOX_DIR.mkdir(exist_ok=True)
+
+_SMTP_PLACEHOLDER_USERS = {"your_gmail@gmail.com", "", "youremail@gmail.com"}
+_SMTP_PLACEHOLDER_PASSES = {"your_16char_app_password", "", "yourpassword"}
+
+
+class SendEmailRequest(BaseModel):
+    to: EmailStr
+    subject: str = Field(..., min_length=1, max_length=200)
+    body: str = Field(..., min_length=1, max_length=5000)
+    cc: Optional[EmailStr] = None
+    bcc: Optional[EmailStr] = None
+    template_type: str = "advance"
+    candidate_id: Optional[str] = None
+    candidate_name: Optional[str] = None
+
+
+class SendEmailResponse(BaseModel):
+    success: bool
+    message: str
+    delivery_mode: str = "sent"   # "sent" | "queued"
+    email_log_id: Optional[str] = None
+
+
+def _build_mime_message(
+    to: str,
+    subject: str,
+    body: str,
+    sender_name: str,
+    cc: Optional[str],
+    bcc: Optional[str],
+):
+    """Build a MIME email message object."""
+    import smtplib  # noqa: F401
+    from email.header import Header
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.utils import formataddr
+
+    safe_sender = formataddr((str(Header(sender_name, "utf-8")), SMTP_USER or "noreply@pixls.app"))
+    msg = MIMEMultipart("alternative")
+    msg["From"] = safe_sender
+    msg["To"] = to
+    msg["Subject"] = Header(subject, "utf-8")
+    if cc:
+        msg["Cc"] = cc
+    if bcc:
+        msg["Bcc"] = bcc
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    html_safe_body = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html_body = (
+        "<!DOCTYPE html><html><head>"
+        '<meta charset="UTF-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        "<style>"
+        "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+        "background:#f9fafb;margin:0;padding:24px}"
+        ".card{background:#fff;border-radius:12px;padding:32px;max-width:600px;"
+        "margin:auto;border:1px solid #e5e7eb}"
+        "pre{white-space:pre-wrap;font-family:inherit;font-size:15px;line-height:1.7;color:#374151}"
+        ".footer{margin-top:24px;padding-top:16px;border-top:1px solid #e5e7eb;"
+        "font-size:12px;color:#9ca3af}"
+        "</style></head><body>"
+        f'<div class="card"><pre>{html_safe_body}</pre>'
+        '<div class="footer">Sent via PIXLS Hiring Platform</div></div>'
+        "</body></html>"
+    )
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    return msg
+
+
+def _smtp_send_sync(
+    to: str,
+    subject: str,
+    body: str,
+    sender_name: str,
+    cc: Optional[str],
+    bcc: Optional[str],
+) -> str:
+    """
+    Try to send via SMTP.  Returns 'sent' on success.
+    Falls back to writing to local outbox on any failure; returns 'queued'.
+    Never raises — the caller always gets a usable result.
+    """
+    import smtplib
+    import ssl
+
+    smtp_ready = (
+        SMTP_USER
+        and SMTP_USER not in _SMTP_PLACEHOLDER_USERS
+        and SMTP_PASS
+        and SMTP_PASS not in _SMTP_PLACEHOLDER_PASSES
+    )
+
+    if smtp_ready:
+        msg = _build_mime_message(to, subject, body, sender_name, cc, bcc)
+        recipients = [to] + ([cc] if cc else []) + ([bcc] if bcc else [])
+
+        # Try STARTTLS first (port 587), then SSL (port 465)
+        for attempt_fn in (_try_starttls, _try_ssl):
+            try:
+                attempt_fn(msg, recipients)
+                logger.info("Email delivered via SMTP to %s", to)
+                return "sent"
+            except smtplib.SMTPAuthenticationError as exc:
+                code = exc.smtp_code
+                raw = exc.smtp_error
+                if isinstance(raw, bytes):
+                    raw = raw.decode(errors="replace")
+                logger.error("SMTP auth failed (%s %s) — falling back to outbox", code, raw)
+                break   # auth failure won't be fixed by retrying on another port
+            except Exception as exc:
+                logger.warning("SMTP attempt failed (%s: %s), trying next method", type(exc).__name__, exc)
+
+    # ── Local outbox fallback ─────────────────────────────────────────────────
+    _save_to_outbox(to, subject, body, sender_name, cc, bcc)
+    return "queued"
+
+
+def _try_starttls(msg, recipients: List[str]) -> None:
+    import smtplib
+    import ssl
+    with smtplib.SMTP(SMTP_HOST, 587, timeout=20) as server:
+        server.ehlo()
+        server.starttls(context=ssl.create_default_context())
+        server.ehlo()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, recipients, msg.as_string())
+
+
+def _try_ssl(msg, recipients: List[str]) -> None:
+    import smtplib
+    import ssl
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL(SMTP_HOST, 465, context=ctx, timeout=20) as server:
+        server.ehlo()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, recipients, msg.as_string())
+
+
+def _save_to_outbox(
+    to: str,
+    subject: str,
+    body: str,
+    sender_name: str,
+    cc: Optional[str],
+    bcc: Optional[str],
+) -> None:
+    """Persist email to local JSON file so no email is ever lost."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    filename = _OUTBOX_DIR / f"{ts}_{uuid.uuid4().hex[:8]}.json"
+    payload = {
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+        "from": sender_name,
+        "to": to,
+        "cc": cc,
+        "bcc": bcc,
+        "subject": subject,
+        "body": body,
+        "status": "queued",
+    }
+    filename.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    logger.info("Email queued to outbox: %s", filename.name)
+
+
+@api_router.post("/email/send", response_model=SendEmailResponse)
+async def send_candidate_email(
+    payload: SendEmailRequest,
+    current_recruiter: RecruiterProfile = Depends(get_current_recruiter),
+):
+    recruiter_id = current_recruiter.recruiter_id
+
+    # Rate limiting
+    one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    recent_count = await db.email_logs.count_documents({
+        "recruiter_id": recruiter_id,
+        "sent_at": {"$gte": one_hour_ago},
+    })
+    if recent_count >= EMAIL_RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit reached: max {EMAIL_RATE_LIMIT} emails per hour.",
+        )
+
+    sender_name = f"{current_recruiter.name} - {current_recruiter.company}"
+    delivery_mode = await asyncio.to_thread(
+        _smtp_send_sync,
+        payload.to,
+        payload.subject,
+        payload.body,
+        sender_name,
+        payload.cc,
+        payload.bcc,
+    )
+
+    # Persist log regardless of delivery mode
+    log_id = str(uuid.uuid4())
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.email_logs.insert_one({
+        "email_log_id": log_id,
+        "recruiter_id": recruiter_id,
+        "recruiter_name": current_recruiter.name,
+        "to": payload.to,
+        "cc": payload.cc,
+        "bcc": payload.bcc,
+        "subject": payload.subject,
+        "body": payload.body,
+        "template_type": payload.template_type,
+        "candidate_id": payload.candidate_id,
+        "candidate_name": payload.candidate_name,
+        "sent_at": now_iso,
+        "delivery_mode": delivery_mode,
+    })
+
+    if delivery_mode == "sent":
+        msg = f"Email sent to {payload.to}"
+    else:
+        msg = (
+            f"Email queued for {payload.to}. "
+            "SMTP is not configured — email saved to outbox. "
+            "Set PIXLS_SMTP_USER + PIXLS_SMTP_PASS in backend/.env to enable real delivery."
+        )
+
+    return SendEmailResponse(
+        success=True,
+        message=msg,
+        delivery_mode=delivery_mode,
+        email_log_id=log_id,
+    )
+
+
+@api_router.get("/email/test-smtp")
+async def test_smtp_connection(
+    current_recruiter: RecruiterProfile = Depends(get_current_recruiter),
+):
+    """Diagnose SMTP connectivity — returns a clear status without sending anything."""
+    import smtplib
+    import ssl
+
+    if not SMTP_USER or SMTP_USER in _SMTP_PLACEHOLDER_USERS:
+        return {"status": "unconfigured", "detail": "PIXLS_SMTP_USER not set in backend/.env"}
+    if not SMTP_PASS or SMTP_PASS in _SMTP_PLACEHOLDER_PASSES:
+        return {"status": "unconfigured", "detail": "PIXLS_SMTP_PASS not set in backend/.env"}
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, 587, timeout=10) as server:
+            server.ehlo()
+            server.starttls(context=ssl.create_default_context())
+            server.ehlo()
+            server.login(SMTP_USER, SMTP_PASS)
+        return {"status": "ok", "detail": f"SMTP authenticated as {SMTP_USER} ✅"}
+    except smtplib.SMTPAuthenticationError as exc:
+        raw = exc.smtp_error
+        if isinstance(raw, bytes):
+            raw = raw.decode(errors="replace")
+        return {
+            "status": "auth_failed",
+            "detail": (
+                f"Gmail rejected the password ({exc.smtp_code}: {raw}). "
+                "Generate a fresh App Password at https://myaccount.google.com/apppasswords "
+                "(requires 2-Step Verification to be ON on the account)."
+            ),
+        }
+    except Exception as exc:
+        return {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+
+
+@api_router.get("/email/history")
+async def get_email_history(
+    current_recruiter: RecruiterProfile = Depends(get_current_recruiter),
+):
+    """Return the last 200 emails sent by this recruiter, newest first."""
+    cursor = db.email_logs.find(
+        {"recruiter_id": current_recruiter.recruiter_id},
+        {"_id": 0},
+    ).sort("sent_at", -1).limit(200)
+    logs = [doc async for doc in cursor]
+    return {"logs": logs, "total": len(logs)}
 
 
 app.include_router(api_router)

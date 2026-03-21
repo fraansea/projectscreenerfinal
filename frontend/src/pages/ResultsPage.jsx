@@ -1,6 +1,6 @@
-import { Fragment, useEffect, useMemo, useState } from "react";
-import { motion } from "framer-motion";
-import { ChevronDown, ChevronUp, Copy, Download, ExternalLink } from "lucide-react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { ChevronDown, ChevronUp, Copy, Download, ExternalLink, Mail, X, Send, Clock, ShieldCheck } from "lucide-react";
 import { Link, useParams } from "react-router-dom";
 import { toast } from "../components/ui/sonner";
 import { Button } from "../components/ui/button";
@@ -17,8 +17,205 @@ import {
 import { KpiCard } from "../components/KpiCard";
 import { ScoreBadge } from "../components/ScoreBadge";
 import axios from "axios";
-import { getResults } from "../services/api";
+import { getResults, sendEmail, getEmailHistory } from "../services/api";
 import { useAuth } from "../context/AuthContext";
+
+const TEMPLATE_COLORS = {
+  advance: { pill: "border-green-200 bg-green-50 text-green-700", dot: "bg-green-500", label: "🎉 Advance" },
+  waitlist: { pill: "border-amber-200 bg-amber-50 text-amber-700", dot: "bg-amber-500", label: "⏳ Waitlist" },
+  reject: { pill: "border-blue-200 bg-blue-50 text-blue-700", dot: "bg-blue-500", label: "❌ Reject" },
+};
+
+function EmailModal({ candidate, onClose, token }) {
+  const email = candidate.email_template || {};
+  const [templateType, setTemplateType] = useState(email.template_type || "advance");
+  const [to, setTo] = useState(candidate.candidate_email || "");
+  const [cc, setCc] = useState("");
+  const [bcc, setBcc] = useState("");
+  const [subject, setSubject] = useState(email.subject || "");
+  const [body, setBody] = useState(email.body || "");
+  const [sending, setSending] = useState(false);
+  const overlayRef = useRef(null);
+
+  const templates = {
+    advance: { subject: email.subject || `Interview Invitation — ${candidate.candidate_name}`, body: email.body || "" },
+    waitlist: {
+      subject: `Application Update — ${candidate.candidate_name}`,
+      body: `Hi ${candidate.candidate_name.split(" ")[0]},\n\nThank you for applying. Your profile was competitive and we've added you to our talent pipeline.\n\nWe'll reach out when a matching position opens.\n\nBest regards,\nHR Team`,
+    },
+    reject: {
+      subject: `Application Status — ${candidate.candidate_name}`,
+      body: `Hi ${candidate.candidate_name.split(" ")[0]},\n\nThank you for your interest in this role. After careful review, we won't be moving forward at this time.\n\nWe appreciate the time you invested and encourage you to apply for future roles.\n\nBest regards,\nHR Team`,
+    },
+  };
+
+  // When the backend already generated the correct template, use it for whichever type matches
+  if (email.template_type === "advance") templates.advance = { subject: email.subject, body: email.body };
+  if (email.template_type === "waitlist") templates.waitlist = { subject: email.subject, body: email.body };
+  if (email.template_type === "reject") templates.reject = { subject: email.subject, body: email.body };
+
+  const switchTemplate = (type) => {
+    setTemplateType(type);
+    setSubject(templates[type].subject);
+    setBody(templates[type].body);
+  };
+
+  const handleSend = async () => {
+    if (!to.trim()) { toast.error("Recipient email is required."); return; }
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(to.trim())) { toast.error("Invalid email address."); return; }
+
+    setSending(true);
+    try {
+      const result = await sendEmail(
+        { to: to.trim(), subject, body, cc: cc.trim() || undefined, bcc: bcc.trim() || undefined,
+          template_type: templateType, candidate_id: candidate.candidate_id, candidate_name: candidate.candidate_name },
+        token
+      );
+      if (result.delivery_mode === "queued") {
+        toast.success(`Email queued for ${to} — saved to outbox (SMTP not configured yet).`);
+      } else {
+        toast.success(`Email sent to ${to}!`);
+      }
+      onClose(true);
+    } catch (err) {
+      const detail = err?.response?.data?.detail || "Failed to send email. Check SMTP settings.";
+      toast.error(detail);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        ref={overlayRef}
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+        onClick={(e) => { if (e.target === overlayRef.current) onClose(false); }}
+      >
+        <motion.div
+          initial={{ opacity: 0, scale: 0.95, y: 20 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          exit={{ opacity: 0, scale: 0.95, y: 20 }}
+          transition={{ type: "spring", stiffness: 300, damping: 25 }}
+          className="relative w-full max-w-2xl rounded-2xl bg-white shadow-2xl"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* Header */}
+          <div className="flex items-center justify-between border-b border-slate-100 px-6 py-4">
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-full bg-[#eb6a45]/10">
+                <Mail size={16} className="text-[#eb6a45]" />
+              </div>
+              <div>
+                <p className="font-semibold text-slate-900">Send Email</p>
+                <p className="text-xs text-slate-500">{candidate.candidate_name}</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => onClose(false)}
+              className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700"
+            >
+              <X size={16} />
+            </button>
+          </div>
+
+          <div className="space-y-4 px-6 py-5">
+            {/* Template selector */}
+            <div>
+              <label className="mb-2 block text-xs font-semibold text-slate-700">Template</label>
+              <div className="flex gap-2">
+                {Object.entries(TEMPLATE_COLORS).map(([type, style]) => (
+                  <button
+                    key={type}
+                    type="button"
+                    onClick={() => switchTemplate(type)}
+                    className={`flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-semibold transition-all ${
+                      templateType === type ? style.pill + " ring-2 ring-offset-1 ring-current" : "border-slate-200 bg-white text-slate-600 hover:border-slate-300"
+                    }`}
+                  >
+                    <span className={`h-2 w-2 rounded-full ${style.dot}`} />
+                    {style.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* To field */}
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">To</label>
+              <Input
+                value={to}
+                onChange={(e) => setTo(e.target.value)}
+                placeholder="candidate@email.com"
+                className="rounded-lg border-slate-200 text-sm focus:border-[#eb6a45] focus:ring-[#eb6a45]"
+              />
+            </div>
+
+            {/* CC / BCC */}
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="mb-1 block text-xs font-semibold text-slate-700">CC</label>
+                <Input value={cc} onChange={(e) => setCc(e.target.value)} placeholder="cc@email.com" className="rounded-lg border-slate-200 text-sm" />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-semibold text-slate-700">BCC</label>
+                <Input value={bcc} onChange={(e) => setBcc(e.target.value)} placeholder="bcc@email.com" className="rounded-lg border-slate-200 text-sm" />
+              </div>
+            </div>
+
+            {/* Subject */}
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">Subject</label>
+              <Input
+                value={subject}
+                onChange={(e) => setSubject(e.target.value)}
+                className="rounded-lg border-slate-200 text-sm focus:border-[#eb6a45] focus:ring-[#eb6a45]"
+              />
+            </div>
+
+            {/* Body */}
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">Message</label>
+              <textarea
+                value={body}
+                onChange={(e) => setBody(e.target.value)}
+                rows={8}
+                className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 font-sans text-sm text-slate-700 leading-relaxed focus:border-[#eb6a45] focus:outline-none focus:ring-1 focus:ring-[#eb6a45]"
+              />
+            </div>
+          </div>
+
+          {/* Footer */}
+          <div className="flex items-center justify-between border-t border-slate-100 px-6 py-4">
+            <p className="text-xs text-slate-400">Sent via Gmail SMTP · PIXLS Hiring</p>
+            <div className="flex gap-2">
+              <Button type="button" variant="outline" onClick={() => onClose(false)} className="rounded-full border-slate-200 text-sm">
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                onClick={handleSend}
+                disabled={sending}
+                className="rounded-full bg-[#eb6a45] text-white hover:bg-[#d7552f] disabled:opacity-60"
+              >
+                {sending ? (
+                  <span className="flex items-center gap-2"><span className="h-3 w-3 animate-spin rounded-full border-2 border-white/30 border-t-white" /> Sending…</span>
+                ) : (
+                  <span className="flex items-center gap-2"><Send size={13} /> Send Email</span>
+                )}
+              </Button>
+            </div>
+          </div>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
 
 const TierTag = ({ tier, testId }) => {
   const style =
@@ -35,7 +232,121 @@ const TierTag = ({ tier, testId }) => {
   );
 };
 
-const DETAIL_TABS = ["Skills", "ATS", "Trust", "Career", "Interview Qs", "Email", "Advisor", "Portfolio"];
+// ── Verification Score Badge & Modal ──────────────────────────────────────────
+
+function VerificationModal({ candidate, onClose }) {
+  const vs = candidate.verification_summary || {};
+  const score = vs.score ?? 0;
+  const checks = vs.checks || [];
+  const color =
+    vs.badge_color === "green" ? { ring: "ring-green-300", bg: "bg-green-100", text: "text-green-800", bar: "bg-green-500" }
+    : vs.badge_color === "yellow" ? { ring: "ring-yellow-300", bg: "bg-yellow-100", text: "text-yellow-800", bar: "bg-yellow-400" }
+    : vs.badge_color === "orange" ? { ring: "ring-orange-300", bg: "bg-orange-100", text: "text-orange-800", bar: "bg-orange-500" }
+    : { ring: "ring-red-300", bg: "bg-red-100", text: "text-red-700", bar: "bg-red-500" };
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+        onClick={onClose}
+      >
+        <motion.div
+          initial={{ opacity: 0, scale: 0.95, y: 16 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          exit={{ opacity: 0, scale: 0.95, y: 16 }}
+          transition={{ type: "spring", stiffness: 300, damping: 26 }}
+          className="relative w-full max-w-md rounded-2xl bg-white shadow-2xl"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* Header */}
+          <div className="flex items-center justify-between border-b border-slate-100 px-6 py-4">
+            <div className="flex items-center gap-3">
+              <div className={`flex h-9 w-9 items-center justify-center rounded-full ${color.bg}`}>
+                <ShieldCheck size={16} className={color.text} />
+              </div>
+              <div>
+                <p className="font-semibold text-slate-900">Verification Breakdown</p>
+                <p className="text-xs text-slate-500">{candidate.candidate_name}</p>
+              </div>
+            </div>
+            <button type="button" onClick={onClose} className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 hover:bg-slate-100 hover:text-slate-700">
+              <X size={16} />
+            </button>
+          </div>
+
+          {/* Score ring */}
+          <div className="flex flex-col items-center py-6 gap-2">
+            <div className={`flex h-20 w-20 items-center justify-center rounded-full ring-4 ${color.ring} ${color.bg}`}>
+              <span className={`text-2xl font-extrabold ${color.text}`}>{score}</span>
+            </div>
+            <p className={`text-sm font-semibold ${color.text}`}>{vs.status || "Review Required"}</p>
+            <p className="text-xs text-slate-400">{vs.checks_passed ?? 0}/{vs.checks_total ?? 5} checks passed</p>
+            <div className="mt-2 w-48 rounded-full bg-slate-100 h-2">
+              <div className={`h-2 rounded-full ${color.bar} transition-all`} style={{ width: `${score}%` }} />
+            </div>
+          </div>
+
+          {/* Checks list */}
+          <div className="px-6 pb-6 space-y-2">
+            {checks.map((c, i) => (
+              <div key={i} className={`flex items-start gap-2 rounded-lg p-3 text-sm
+                ${c.startsWith("✅") ? "bg-green-50 text-green-800"
+                  : c.startsWith("⚠️") ? "bg-yellow-50 text-yellow-800"
+                  : "bg-red-50 text-red-700"}`}>
+                {c}
+              </div>
+            ))}
+            {!checks.length && <p className="text-xs text-slate-400 italic">No check data available.</p>}
+          </div>
+
+          {/* Footer */}
+          <div className="flex justify-end border-t border-slate-100 px-6 py-3">
+            <button type="button" onClick={onClose} className="rounded-full border border-slate-200 px-4 py-1.5 text-sm text-slate-600 hover:border-[#eb6a45] hover:text-[#eb6a45]">
+              Close
+            </button>
+          </div>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
+function VerificationBadge({ candidate }) {
+  const vs = candidate.verification_summary || {};
+  const score = vs.score ?? 0;
+  const [showModal, setShowModal] = useState(false);
+
+  const dot =
+    vs.badge_color === "green" ? "bg-green-500"
+    : vs.badge_color === "yellow" ? "bg-yellow-400"
+    : vs.badge_color === "orange" ? "bg-orange-400"
+    : "bg-red-400";
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setShowModal(true)}
+        className="flex flex-col items-start gap-0.5 rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-left transition-colors hover:border-slate-400"
+        title="Click for full verification breakdown"
+      >
+        <div className="flex items-center gap-1.5">
+          <span className={`h-2 w-2 rounded-full shrink-0 ${dot}`} />
+          <span className="text-sm font-bold text-slate-800">{score}/100</span>
+        </div>
+        <span className="text-[10px] text-slate-400">{vs.checks_passed ?? 0}/5 checks</span>
+      </button>
+      {showModal && (
+        <VerificationModal candidate={candidate} onClose={() => setShowModal(false)} />
+      )}
+    </>
+  );
+}
+
+const DETAIL_TABS = ["Skills", "ATS", "Trust", "Career", "Notable Achievements", "Email", "Portfolio"];
 
 const ATSBadge = ({ label, score }) => {
   const style = label === "Green"
@@ -68,7 +379,7 @@ function CandidateDetailPanel({ candidate, analysis }) {
 
   return (
     <tr data-testid={`candidate-detail-row-${cid}`}>
-      <td colSpan={6} className="bg-slate-50 p-4">
+      <td colSpan={9} className="bg-slate-50 p-4">
         {/* Tab bar */}
         <div className="mb-4 flex flex-wrap gap-1 border-b border-slate-200 pb-2">
           {DETAIL_TABS.map((tab) => (
@@ -237,23 +548,89 @@ function CandidateDetailPanel({ candidate, analysis }) {
           </div>
         )}
 
-        {/* ── Interview Qs tab ── */}
-        {activeTab === "Interview Qs" && (
-          <div className="space-y-2" data-testid={`candidate-interview-panel-${cid}`}>
-            <div className="flex items-center gap-2 mb-2">
-              <p className="text-sm font-semibold text-slate-900">Suggested Interview Questions</p>
-              <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${iq.generated_by === "llm-groq" ? "bg-violet-100 text-violet-700" : "bg-slate-100 text-slate-600"}`}>
-                {iq.generated_by === "llm-groq" ? "🤖 Groq Llama 3.1 70B" : "Rule-based"}
-              </span>
+        {/* ── Notable Achievements tab ── */}
+        {activeTab === "Notable Achievements" && (() => {
+          const na = candidate.notable_achievements || {};
+          const list = na.top_achievements || [];
+          const typeLabel = {
+            github: "GitHub Repo",
+            hackathon: "Hackathon / Competition",
+            certification: "Certification",
+            linkedin: "LinkedIn",
+            portfolio: "Portfolio Project",
+          };
+          const typeIcon = {
+            github: "💻",
+            hackathon: "🎖️",
+            certification: "📜",
+            linkedin: "🔗",
+            portfolio: "🌐",
+          };
+          return (
+            <div className="space-y-3" data-testid={`candidate-achievements-panel-${cid}`}>
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-semibold text-slate-900">
+                  Notable Achievements
+                  <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">
+                    {list.length} found · {na.total_found ?? 0} total scanned
+                  </span>
+                </p>
+              </div>
+
+              {list.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 p-5 text-center">
+                  <p className="text-xs text-slate-400 italic">No notable achievements detected for this candidate.</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {list.map((ach, i) => (
+                    <div key={i} className="flex items-start gap-3 rounded-lg border border-slate-200 bg-white p-3">
+                      {/* Medal */}
+                      <span className="mt-0.5 text-xl shrink-0">{ach.medal}</span>
+
+                      {/* Content */}
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <p className="text-sm font-semibold text-slate-800 leading-tight truncate">
+                              {ach.title}
+                            </p>
+                            <p className="mt-0.5 text-[11px] text-slate-400">
+                              {typeIcon[ach.achievement_type] || "📌"}{" "}
+                              {typeLabel[ach.achievement_type] || ach.achievement_type}
+                              {ach.stars > 0 && ` · ${ach.stars}⭐`}
+                              {ach.forks > 0 && ` · ${ach.forks} forks`}
+                            </p>
+                            {ach.description && ach.description !== ach.title && (
+                              <p className="mt-1 text-[11px] text-slate-500 leading-relaxed line-clamp-2">
+                                {ach.description}
+                              </p>
+                            )}
+                          </div>
+
+                          {/* Score + link */}
+                          <div className="flex flex-col items-end gap-1 shrink-0">
+                            <span className="text-xs font-bold text-slate-700">{ach.score}/100</span>
+                            {(ach.url || ach.deployed_url) && (
+                              <a
+                                href={ach.deployed_url || ach.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex items-center gap-1 text-[10px] text-blue-600 hover:underline"
+                              >
+                                {ach.deployed_url ? "🔗 Live" : "View"} <ExternalLink size={10} />
+                              </a>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
-            <ol className="list-decimal pl-4 space-y-2">
-              {(iq.questions || []).map((q, i) => (
-                <li key={i} className="text-xs text-slate-700 leading-relaxed">{q}</li>
-              ))}
-              {!(iq.questions || []).length && <p className="text-xs text-slate-500">No questions generated.</p>}
-            </ol>
-          </div>
-        )}
+          );
+        })()}
 
         {/* ── Email tab ── */}
         {activeTab === "Email" && (
@@ -280,24 +657,6 @@ function CandidateDetailPanel({ candidate, analysis }) {
           </div>
         )}
 
-        {/* ── Advisor tab ── */}
-        {activeTab === "Advisor" && (
-          <div className="space-y-3" data-testid={`candidate-advisor-panel-${cid}`}>
-            <p className="text-sm font-semibold text-slate-900">Resume Improvement Advisor</p>
-            {advice.priority_fix && (
-              <div className="rounded-md border border-[#eb6a45] bg-orange-50 p-3">
-                <p className="text-xs font-semibold text-[#eb6a45]">Priority Fix</p>
-                <p className="mt-1 text-xs text-slate-700">{advice.priority_fix}</p>
-              </div>
-            )}
-            <ol className="list-decimal pl-4 space-y-2">
-              {(advice.advice || []).map((item, i) => (
-                <li key={i} className="text-xs text-slate-700 leading-relaxed">{item}</li>
-              ))}
-              {!(advice.advice || []).length && <p className="text-xs text-slate-500">No specific advice — profile is strong.</p>}
-            </ol>
-          </div>
-        )}
 
         {/* ── Portfolio tab ── */}
         {activeTab === "Portfolio" && (
@@ -567,6 +926,8 @@ export default function ResultsPage() {
   const [tierFilter, setTierFilter] = useState("all");
   const [sortOrder, setSortOrder] = useState("desc");
   const [expandedCandidateId, setExpandedCandidateId] = useState("");
+  const [emailModalCandidate, setEmailModalCandidate] = useState(null);
+  const [sentEmails, setSentEmails] = useState({}); // { candidate_id: timestamp }
 
   useEffect(() => {
     const fetchResults = async () => {
@@ -769,8 +1130,11 @@ export default function ResultsPage() {
                 <TableHead data-testid="header-candidate-name">Candidate</TableHead>
                 <TableHead data-testid="header-fit-score">Fit Score</TableHead>
                 <TableHead data-testid="header-tier">Tier</TableHead>
+                <TableHead data-testid="header-verification">Verification</TableHead>
+                <TableHead data-testid="header-achievements">Achievements</TableHead>
                 <TableHead data-testid="header-subscores">Sub-scores</TableHead>
                 <TableHead data-testid="header-github">Verified Links & Activity</TableHead>
+                <TableHead data-testid="header-email">Email</TableHead>
                 <TableHead data-testid="header-actions">Details</TableHead>
               </TableRow>
             </TableHeader>
@@ -801,6 +1165,33 @@ export default function ResultsPage() {
 
                       <TableCell data-testid={`candidate-tier-${candidate.candidate_id}`}>
                         <TierTag tier={candidate.tier} testId={`tier-tag-${candidate.candidate_id}`} />
+                      </TableCell>
+
+                      <TableCell data-testid={`candidate-verification-${candidate.candidate_id}`}>
+                        <VerificationBadge candidate={candidate} />
+                      </TableCell>
+
+                      <TableCell data-testid={`candidate-achievements-${candidate.candidate_id}`}>
+                        {(() => {
+                          const list = candidate.notable_achievements?.top_achievements || [];
+                          if (!list.length) return <p className="text-[11px] text-slate-400 italic">None</p>;
+                          const typeIcon = { github: "💻", hackathon: "🎖️", certification: "📜", linkedin: "🔗", portfolio: "🌐" };
+                          return (
+                            <div className="space-y-1">
+                              {list.slice(0, 2).map((a, i) => (
+                                <div key={i} className="flex items-center gap-1">
+                                  <span className="text-xs">{a.medal}</span>
+                                  <span className="text-[11px] text-slate-600 truncate max-w-[120px]" title={a.title}>
+                                    {typeIcon[a.achievement_type] || "📌"} {a.title}
+                                  </span>
+                                </div>
+                              ))}
+                              {list.length > 2 && (
+                                <p className="text-[10px] text-slate-400">+{list.length - 2} more</p>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </TableCell>
 
                       <TableCell data-testid={`candidate-subscores-${candidate.candidate_id}`}>
@@ -844,6 +1235,32 @@ export default function ResultsPage() {
                         </p>
                       </TableCell>
 
+                      <TableCell data-testid={`candidate-email-cell-${candidate.candidate_id}`}>
+                        <div className="flex flex-col gap-1.5">
+                          {candidate.candidate_email ? (
+                            <p className="max-w-[160px] truncate font-mono text-[11px] text-slate-500" title={candidate.candidate_email}>
+                              {candidate.candidate_email}
+                            </p>
+                          ) : (
+                            <p className="text-[11px] text-slate-400 italic">No email found</p>
+                          )}
+                          <Button
+                            type="button"
+                            size="sm"
+                            onClick={() => setEmailModalCandidate(candidate)}
+                            className="rounded-full bg-[#eb6a45] text-white hover:bg-[#d7552f] text-xs px-3"
+                            data-testid={`send-email-button-${candidate.candidate_id}`}
+                          >
+                            <Mail size={12} className="mr-1" /> Send
+                          </Button>
+                          {sentEmails[candidate.candidate_id] && (
+                            <span className="flex items-center gap-1 text-[10px] text-green-600 font-medium">
+                              <Clock size={9} /> Sent today
+                            </span>
+                          )}
+                        </div>
+                      </TableCell>
+
                       <TableCell data-testid={`candidate-expand-cell-${candidate.candidate_id}`}>
                         <Button
                           type="button"
@@ -874,6 +1291,19 @@ export default function ResultsPage() {
           </Table>
         </CardContent>
       </Card>
+
+      {emailModalCandidate && (
+        <EmailModal
+          candidate={emailModalCandidate}
+          token={token}
+          onClose={(sent) => {
+            if (sent) {
+              setSentEmails((prev) => ({ ...prev, [emailModalCandidate.candidate_id]: Date.now() }));
+            }
+            setEmailModalCandidate(null);
+          }}
+        />
+      )}
     </section>
   );
 }
