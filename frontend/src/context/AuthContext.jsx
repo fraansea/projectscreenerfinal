@@ -34,13 +34,17 @@ export const AuthProvider = ({ children }) => {
       try {
         const me = await getRecruiterMe(token);
         setRecruiter(me);
-      } catch {
-        localStorage.removeItem(TOKEN_STORAGE_KEY);
-        localStorage.removeItem(PROFILE_STORAGE_KEY);
-        sessionStorage.removeItem(TOKEN_STORAGE_KEY);
-        sessionStorage.removeItem(PROFILE_STORAGE_KEY);
-        setToken(null);
-        setRecruiter(null);
+      } catch (err) {
+        // Only drop session when the token is rejected — not on network/CORS/server errors
+        const status = err?.response?.status;
+        if (status === 401 || status === 403) {
+          localStorage.removeItem(TOKEN_STORAGE_KEY);
+          localStorage.removeItem(PROFILE_STORAGE_KEY);
+          sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+          sessionStorage.removeItem(PROFILE_STORAGE_KEY);
+          setToken(null);
+          setRecruiter(null);
+        }
       } finally {
         setIsReady(true);
       }

@@ -64,7 +64,7 @@ webpackConfig.devServer = (devServerConfig) => {
   // Proxy /api requests to the FastAPI backend so a single ngrok tunnel covers everything
   devServerConfig.proxy = {
     "/api": {
-      target: "http://localhost:8001",
+      target: "http://localhost:8000",
       changeOrigin: true,
       secure: false,
     },

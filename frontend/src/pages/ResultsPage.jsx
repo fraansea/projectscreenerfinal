@@ -236,13 +236,16 @@ const TierTag = ({ tier, testId }) => {
 
 function VerificationModal({ candidate, onClose }) {
   const vs = candidate.verification_summary || {};
-  const score = vs.score ?? 0;
   const checks = vs.checks || [];
+  const checksPassed = vs.checks_passed ?? checks.filter((c) => c?.passed).length;
+  const checksTotal = vs.checks_total ?? checks.length;
+  const passRate = checksTotal ? Math.round((checksPassed / checksTotal) * 100) : 0;
   const color =
-    vs.badge_color === "green" ? { ring: "ring-green-300", bg: "bg-green-100", text: "text-green-800", bar: "bg-green-500" }
-    : vs.badge_color === "yellow" ? { ring: "ring-yellow-300", bg: "bg-yellow-100", text: "text-yellow-800", bar: "bg-yellow-400" }
-    : vs.badge_color === "orange" ? { ring: "ring-orange-300", bg: "bg-orange-100", text: "text-orange-800", bar: "bg-orange-500" }
-    : { ring: "ring-red-300", bg: "bg-red-100", text: "text-red-700", bar: "bg-red-500" };
+    passRate >= 80
+      ? { ring: "ring-green-300", bg: "bg-green-100", text: "text-green-800", bar: "bg-green-500" }
+      : passRate >= 50
+        ? { ring: "ring-yellow-300", bg: "bg-yellow-100", text: "text-yellow-800", bar: "bg-yellow-400" }
+        : { ring: "ring-red-300", bg: "bg-red-100", text: "text-red-700", bar: "bg-red-500" };
 
   return (
     <AnimatePresence>
@@ -277,28 +280,37 @@ function VerificationModal({ candidate, onClose }) {
             </button>
           </div>
 
-          {/* Score ring */}
+          {/* Verification ring */}
           <div className="flex flex-col items-center py-6 gap-2">
             <div className={`flex h-20 w-20 items-center justify-center rounded-full ring-4 ${color.ring} ${color.bg}`}>
-              <span className={`text-2xl font-extrabold ${color.text}`}>{score}</span>
+              <span className={`text-2xl font-extrabold ${color.text}`}>{passRate}%</span>
             </div>
-            <p className={`text-sm font-semibold ${color.text}`}>{vs.status || "Review Required"}</p>
-            <p className="text-xs text-slate-400">{vs.checks_passed ?? 0}/{vs.checks_total ?? 5} checks passed</p>
+            <p className={`text-sm font-semibold ${color.text}`}>{vs.status || "verified_partially"}</p>
+            <p className="text-xs text-slate-400">{checksPassed}/{checksTotal || 5} checks passed</p>
             <div className="mt-2 w-48 rounded-full bg-slate-100 h-2">
-              <div className={`h-2 rounded-full ${color.bar} transition-all`} style={{ width: `${score}%` }} />
+              <div className={`h-2 rounded-full ${color.bar} transition-all`} style={{ width: `${passRate}%` }} />
             </div>
           </div>
 
           {/* Checks list */}
           <div className="px-6 pb-6 space-y-2">
-            {checks.map((c, i) => (
-              <div key={i} className={`flex items-start gap-2 rounded-lg p-3 text-sm
-                ${c.startsWith("✅") ? "bg-green-50 text-green-800"
-                  : c.startsWith("⚠️") ? "bg-yellow-50 text-yellow-800"
-                  : "bg-red-50 text-red-700"}`}>
-                {c}
-              </div>
-            ))}
+            {checks.map((c, i) => {
+              const legacy = typeof c === "string" ? c : null;
+              const passed =
+                typeof c?.passed === "boolean"
+                  ? c.passed
+                  : legacy
+                    ? legacy.startsWith("✅")
+                    : false;
+              const label = c?.name || (legacy ? legacy.replace(/^[✅❌⚠️]\s*/, "").split(":")[0] : `Check ${i + 1}`);
+              const detail = c?.detail || (legacy ? legacy : "");
+              return (
+                <div key={i} className={`rounded-lg p-3 text-sm ${passed ? "bg-green-50 text-green-800" : "bg-red-50 text-red-700"}`}>
+                  <p className="font-semibold">{passed ? "PASS" : "FAIL"} · {label}</p>
+                  <p className="mt-0.5 text-xs opacity-90">{detail}</p>
+                </div>
+              );
+            })}
             {!checks.length && <p className="text-xs text-slate-400 italic">No check data available.</p>}
           </div>
 
@@ -316,14 +328,12 @@ function VerificationModal({ candidate, onClose }) {
 
 function VerificationBadge({ candidate }) {
   const vs = candidate.verification_summary || {};
-  const score = vs.score ?? 0;
+  const legacyPassed = (vs.checks || []).filter((c) => typeof c === "string" && c.startsWith("✅")).length;
+  const score = vs.checks_total
+    ? Math.round(((vs.checks_passed || 0) / vs.checks_total) * 100)
+    : Math.round((((vs.checks || []).filter((c) => c?.passed).length || legacyPassed) / Math.max((vs.checks || []).length, 1)) * 100);
   const [showModal, setShowModal] = useState(false);
-
-  const dot =
-    vs.badge_color === "green" ? "bg-green-500"
-    : vs.badge_color === "yellow" ? "bg-yellow-400"
-    : vs.badge_color === "orange" ? "bg-orange-400"
-    : "bg-red-400";
+  const dot = score >= 80 ? "bg-green-500" : score >= 50 ? "bg-yellow-400" : "bg-red-400";
 
   return (
     <>
@@ -335,9 +345,9 @@ function VerificationBadge({ candidate }) {
       >
         <div className="flex items-center gap-1.5">
           <span className={`h-2 w-2 rounded-full shrink-0 ${dot}`} />
-          <span className="text-sm font-bold text-slate-800">{score}/100</span>
+          <span className="text-sm font-bold text-slate-800">{score}%</span>
         </div>
-        <span className="text-[10px] text-slate-400">{vs.checks_passed ?? 0}/5 checks</span>
+        <span className="text-[10px] text-slate-400">{vs.checks_passed ?? 0}/{vs.checks_total ?? 5} checks</span>
       </button>
       {showModal && (
         <VerificationModal candidate={candidate} onClose={() => setShowModal(false)} />
@@ -346,7 +356,7 @@ function VerificationBadge({ candidate }) {
   );
 }
 
-const DETAIL_TABS = ["Skills", "ATS", "Trust", "Career", "Notable Achievements", "Email", "Portfolio"];
+const DETAIL_TABS = ["Match", "ATS", "Verification", "Achievements", "Portfolio", "Email"];
 
 const ATSBadge = ({ label, score }) => {
   const style = label === "Green"
@@ -362,15 +372,14 @@ const ATSBadge = ({ label, score }) => {
 };
 
 function CandidateDetailPanel({ candidate, analysis }) {
-  const [activeTab, setActiveTab] = useState("Skills");
+  const [activeTab, setActiveTab] = useState("Match");
   const cid = candidate.candidate_id;
   const ats = candidate.ats_score || {};
-  const trust = candidate.trust_score || {};
-  const career = candidate.career_trajectory || {};
-  const bias = candidate.bias_flags || {};
-  const iq = candidate.interview_questions || {};
+  const verification = candidate.verification_summary || {};
   const email = candidate.email_template || {};
-  const advice = candidate.resume_advice || {};
+  const predictedCategory = candidate.predicted_category;
+  const categoryConfidencePct = Math.round((candidate.category_confidence || 0) * 100);
+  const categoryAlignmentLabel = candidate.category_alignment_label || (predictedCategory ? "Unknown" : "");
 
   const copyToClipboard = (text) => {
     navigator.clipboard?.writeText(text).catch(() => {});
@@ -398,8 +407,8 @@ function CandidateDetailPanel({ candidate, analysis }) {
           ))}
         </div>
 
-        {/* ── Skills tab (original) ── */}
-        {activeTab === "Skills" && (
+        {/* ── Match tab ── */}
+        {activeTab === "Match" && (
           <div className="grid gap-4 lg:grid-cols-3" data-testid={`candidate-detail-grid-${cid}`}>
             <div>
               <p className="text-sm font-semibold text-slate-900">Matched Skills</p>
@@ -418,12 +427,29 @@ function CandidateDetailPanel({ candidate, analysis }) {
               </div>
             </div>
             <div>
-              <p className="text-sm font-semibold text-slate-900">Smart Portfolio Verifier</p>
+              <p className="text-sm font-semibold text-slate-900">Match Evidence</p>
+              <div className="mt-2 rounded-md border border-slate-200 bg-white p-2">
+                <p className="text-xs font-semibold text-slate-700">Recommendation</p>
+                <p className="mt-1 text-xs text-slate-600">{candidate.shortlist_recommendation || "Review"}</p>
+              </div>
+              {/* Predicted Role card */}
+              <div className="mt-2 rounded-xl border border-slate-200 bg-white p-3">
+                <p className="text-xs font-semibold text-slate-800">Predicted Role</p>
+                {predictedCategory ? (
+                  <div className="mt-2 space-y-1">
+                    <p className="text-sm font-bold text-slate-900">{predictedCategory}</p>
+                    <p className="text-xs text-slate-600">Model Confidence: <span className="font-semibold">{categoryConfidencePct}%</span></p>
+                    <p className="text-xs text-slate-600">JD Alignment: <span className="font-semibold">{categoryAlignmentLabel}</span></p>
+                  </div>
+                ) : (
+                  <p className="mt-1 text-xs text-slate-400 italic">No prediction available.</p>
+                )}
+              </div>
               <div className="mt-2 rounded-md border border-blue-200 bg-blue-50 p-2">
                 <p className="text-xs text-blue-900">
                   Stack Coverage: {candidate.verified_links.github_analysis?.stack_coverage_pct || 0}% | Best Complexity: {candidate.verified_links.github_analysis?.best_project_complexity || 0}/10
                 </p>
-                <p className="text-xs text-blue-900">{candidate.verified_links.smart_portfolio?.hr_insight || "Portfolio insight unavailable"}</p>
+                <p className="text-xs text-blue-900">{candidate.evidence_summary || "Portfolio insight unavailable"}</p>
               </div>
               <div className="mt-2 rounded-md border border-slate-200 bg-white p-2">
                 <p className="text-xs font-semibold text-slate-700">Extraction Intelligence</p>
@@ -463,6 +489,27 @@ function CandidateDetailPanel({ candidate, analysis }) {
           </div>
         )}
 
+        {/* ── Verification tab ── */}
+        {activeTab === "Verification" && (
+          <div className="space-y-3" data-testid={`candidate-verification-panel-${cid}`}>
+            <p className="text-sm font-semibold text-slate-900">Transparent Verification Checks</p>
+            <div className="rounded-md border border-slate-200 bg-white p-3">
+              <p className="text-xs text-slate-500">
+                Status: <span className="font-semibold text-slate-800">{verification.status || "verified_partially"}</span> ·
+                Passed {verification.checks_passed ?? 0}/{verification.checks_total ?? 5}
+              </p>
+            </div>
+            {(verification.checks || []).map((check, idx) => (
+              <div key={`${check.name}-${idx}`} className={`rounded-md border p-3 ${check.passed ? "border-green-200 bg-green-50" : "border-red-200 bg-red-50"}`}>
+                <p className={`text-xs font-semibold ${check.passed ? "text-green-800" : "text-red-700"}`}>
+                  {check.passed ? "PASS" : "FAIL"} · {check.name}
+                </p>
+                <p className={`mt-1 text-xs ${check.passed ? "text-green-700" : "text-red-600"}`}>{check.detail}</p>
+              </div>
+            ))}
+          </div>
+        )}
+
         {/* ── ATS tab ── */}
         {activeTab === "ATS" && (
           <div className="space-y-3" data-testid={`candidate-ats-panel-${cid}`}>
@@ -492,64 +539,8 @@ function CandidateDetailPanel({ candidate, analysis }) {
           </div>
         )}
 
-        {/* ── Trust tab ── */}
-        {activeTab === "Trust" && (
-          <div className="space-y-3" data-testid={`candidate-trust-panel-${cid}`}>
-            <div className="flex items-center gap-3">
-              <span className="text-2xl">{trust.badge || "🟢"}</span>
-              <div>
-                <p className="text-sm font-semibold text-slate-900">Trust Score: {trust.score ?? 100}%</p>
-                <p className="text-xs text-slate-500">Credential integrity: {trust.label || "High"}</p>
-              </div>
-            </div>
-            {(trust.flags || []).length > 0 ? (
-              <div className="rounded-md border border-amber-200 bg-amber-50 p-3">
-                <p className="text-xs font-semibold text-amber-800 mb-1">Flags for Review</p>
-                <ul className="list-disc pl-4 space-y-1">
-                  {trust.flags.map((f, i) => <li key={i} className="text-xs text-amber-700">{f}</li>)}
-                </ul>
-              </div>
-            ) : (
-              <p className="text-xs text-green-700 font-medium">✅ No credibility concerns detected.</p>
-            )}
-            {(bias.flags || []).length > 0 && (
-              <div className="rounded-md border border-purple-200 bg-purple-50 p-3">
-                <p className="text-xs font-semibold text-purple-800 mb-1">Bias & Fairness Signals</p>
-                {bias.flags.map((f, i) => <p key={i} className="text-xs text-purple-700">{f}</p>)}
-                <p className="mt-1 text-xs text-purple-600 italic">{bias.diversity_note}</p>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ── Career tab ── */}
-        {activeTab === "Career" && (
-          <div className="space-y-3" data-testid={`candidate-career-panel-${cid}`}>
-            <div className="flex items-center gap-3">
-              <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${
-                career.label === "Rising" ? "border-green-200 bg-green-50 text-green-700"
-                  : career.label === "Stable" ? "border-blue-200 bg-blue-50 text-blue-700"
-                  : "border-slate-200 bg-slate-50 text-slate-600"
-              }`}>
-                {career.label || "Stable"} · {career.score ?? 0}/100
-              </span>
-              <span className="text-sm text-slate-600">Career Trajectory</span>
-            </div>
-            <div className="w-full rounded-full bg-slate-200 h-2">
-              <div className="h-2 rounded-full bg-[#eb6a45] transition-all" style={{ width: `${career.score ?? 0}%` }} />
-            </div>
-            {(career.notes || []).length > 0 ? (
-              <ul className="list-disc pl-4 space-y-1">
-                {career.notes.map((n, i) => <li key={i} className="text-xs text-slate-700">{n}</li>)}
-              </ul>
-            ) : (
-              <p className="text-xs text-slate-500">No significant trajectory signals detected in resume text.</p>
-            )}
-          </div>
-        )}
-
         {/* ── Notable Achievements tab ── */}
-        {activeTab === "Notable Achievements" && (() => {
+        {activeTab === "Achievements" && (() => {
           const na = candidate.notable_achievements || {};
           const list = na.top_achievements || [];
           const typeLabel = {
@@ -957,19 +948,25 @@ export default function ResultsPage() {
     fetchResults();
   }, [batchId, token]);
 
-  const filteredResults = useMemo(() => {
-    if (!analysis?.results?.length) return [];
+  const safeAnalysis = analysis || {};
+  const safeAnalytics = safeAnalysis.analytics || {};
+  const safeRequiredSkills = Array.isArray(safeAnalysis.required_skills) ? safeAnalysis.required_skills : [];
+  const safeResults = Array.isArray(safeAnalysis.results) ? safeAnalysis.results : [];
 
-    const filtered = analysis.results.filter((candidate) => {
-      const matchSearch = candidate.candidate_name.toLowerCase().includes(search.toLowerCase());
+  const filteredResults = useMemo(() => {
+    if (!safeResults.length) return [];
+
+    const filtered = safeResults.filter((candidate) => {
+      const candidateName = (candidate?.candidate_name || "").toString();
+      const matchSearch = candidateName.toLowerCase().includes(search.toLowerCase());
       const matchTier = tierFilter === "all" || candidate.tier === tierFilter;
       return matchSearch && matchTier;
     });
 
     return filtered.sort((a, b) =>
-      sortOrder === "desc" ? b.fit_score - a.fit_score : a.fit_score - b.fit_score,
+      sortOrder === "desc" ? (b.fit_score || 0) - (a.fit_score || 0) : (a.fit_score || 0) - (b.fit_score || 0),
     );
-  }, [analysis, search, tierFilter, sortOrder]);
+  }, [safeResults, search, tierFilter, sortOrder]);
 
   if (!batchId) {
     return (
@@ -1032,7 +1029,7 @@ export default function ResultsPage() {
             onClick={async () => {
               try {
                 const res = await axios.get(
-                  `${process.env.REACT_APP_BACKEND_URL}/api/screener/export/${batchId}`,
+                  `/api/screener/export/${batchId}`,
                   { headers: { Authorization: `Bearer ${token}` }, responseType: "blob" }
                 );
                 const url = URL.createObjectURL(res.data);
@@ -1061,25 +1058,25 @@ export default function ResultsPage() {
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4" data-testid="results-kpi-grid">
         <KpiCard
           title="Resumes Uploaded"
-          value={analysis.analytics.resumes_uploaded}
+          value={safeAnalytics.resumes_uploaded ?? safeResults.length ?? 0}
           helper="Total processed from ZIP"
           testId="kpi-resumes-uploaded"
         />
         <KpiCard
           title="Average Fit Score"
-          value={`${analysis.analytics.average_fit_score}%`}
+          value={`${safeAnalytics.average_fit_score ?? 0}%`}
           helper="Across all candidates"
           testId="kpi-average-fit"
         />
         <KpiCard
           title="Above 80%"
-          value={analysis.analytics.candidates_above_80}
+          value={safeAnalytics.candidates_above_80 ?? 0}
           helper="Strong-match shortlist"
           testId="kpi-above-80"
         />
         <KpiCard
           title="Required Skills"
-          value={analysis.required_skills.length}
+          value={safeRequiredSkills.length}
           helper="Detected from JD"
           testId="kpi-required-skills"
         />
@@ -1132,8 +1129,8 @@ export default function ResultsPage() {
                 <TableHead data-testid="header-tier">Tier</TableHead>
                 <TableHead data-testid="header-verification">Verification</TableHead>
                 <TableHead data-testid="header-achievements">Achievements</TableHead>
-                <TableHead data-testid="header-subscores">Sub-scores</TableHead>
-                <TableHead data-testid="header-github">Verified Links & Activity</TableHead>
+                <TableHead data-testid="header-subscores">Match Signals</TableHead>
+                <TableHead data-testid="header-github">Verification Snapshot</TableHead>
                 <TableHead data-testid="header-email">Email</TableHead>
                 <TableHead data-testid="header-actions">Details</TableHead>
               </TableRow>
@@ -1196,42 +1193,28 @@ export default function ResultsPage() {
 
                       <TableCell data-testid={`candidate-subscores-${candidate.candidate_id}`}>
                         <p className="text-xs text-slate-600" data-testid={`candidate-skills-score-${candidate.candidate_id}`}>
-                          Skills: {candidate.skills_match_score}%
+                          Matched skills: {candidate.matched_skills?.length || 0}
                         </p>
                         <p className="text-xs text-slate-600" data-testid={`candidate-experience-score-${candidate.candidate_id}`}>
-                          Experience: {candidate.experience_match_score}%
+                          Missing skills: {candidate.missing_skills?.length || 0}
                         </p>
                         <p className="text-xs text-slate-600" data-testid={`candidate-education-score-${candidate.candidate_id}`}>
-                          Education: {candidate.education_match_score}%
+                          Recommendation: {candidate.shortlist_recommendation || "Review"}
                         </p>
                       </TableCell>
 
                       <TableCell data-testid={`candidate-links-${candidate.candidate_id}`}>
                         <p className="text-xs text-slate-600" data-testid={`candidate-github-user-${candidate.candidate_id}`}>
-                          GitHub: {candidate.verified_links.github.username || "N/A"}
+                          GitHub: {candidate?.github_analysis_summary?.username || candidate?.verified_links?.github?.username || "N/A"}
                         </p>
                         <p className="text-xs text-slate-600" data-testid={`candidate-portfolio-bonus-${candidate.candidate_id}`}>
-                          Portfolio bonus: +{candidate.verified_links.smart_portfolio?.verification_bonus || 0}%
+                          LinkedIn: {candidate?.linkedin_summary?.verified ? "Found" : "Not found"}
                         </p>
                         <p className="text-xs text-slate-600" data-testid={`candidate-jd-projects-${candidate.candidate_id}`}>
-                          JD projects: {candidate.verified_links.github_analysis?.jd_relevant_projects || 0}
+                          Portfolio: {candidate?.scanned_links_summary?.portfolio_reachable ? "Reachable" : "Not reachable"}
                         </p>
                         <p className="text-xs text-slate-600" data-testid={`candidate-linkedin-count-${candidate.candidate_id}`}>
-                          LinkedIn links: {candidate.verified_links.linkedin_urls?.length || (candidate.verified_links.linkedin_url ? 1 : 0)}
-                        </p>
-                        <p className="text-xs text-slate-600" data-testid={`candidate-links-scanned-${candidate.candidate_id}`}>
-                          Links scanned: {candidate.verified_links.scanned_links?.length || 0}
-                        </p>
-                        <p className="text-xs text-slate-600" data-testid={`candidate-github-repos-${candidate.candidate_id}`}>
-                          Repos: {candidate.verified_links.github.repo_count}
-                        </p>
-                        <p className="text-xs text-slate-600" data-testid={`candidate-activity-bonus-${candidate.candidate_id}`}>
-                          Activity bonus: +{candidate.verified_links.activity_bonus}%
-                        </p>
-                        <p className="mt-1 text-xs font-medium" data-testid={`candidate-extraction-method-${candidate.candidate_id}`}>
-                          {candidate.github_extraction_method === "llm-groq"
-                            ? <span className="text-violet-600">🤖 LLM (Llama 3.1 70B)</span>
-                            : <span className="text-green-600">✅ Rule-based</span>}
+                          Links scanned: {(candidate?.scanned_links_summary?.total_links ?? candidate?.verified_links?.scanned_links?.length) || 0}
                         </p>
                       </TableCell>
 

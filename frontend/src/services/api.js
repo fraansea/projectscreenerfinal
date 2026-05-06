@@ -1,6 +1,25 @@
 import axios from "axios";
 
-const API_BASE = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const _rawBase = (process.env.REACT_APP_BACKEND_URL || "").trim().replace(/\/$/, "");
+const _isDev = process.env.NODE_ENV === "development";
+
+/**
+ * In development, use same-origin `/api` so the webpack proxy (craco) forwards to FastAPI.
+ * That fixes auth when you open the app as http://192.168.x.x:3000 — `localhost:8000` would
+ * point at the wrong machine otherwise.
+ * In production, use REACT_APP_BACKEND_URL (full origin, no /api).
+ */
+export const API_ORIGIN =
+  _isDev && typeof window !== "undefined"
+    ? window.location.origin
+    : _rawBase || "http://localhost:8000";
+
+const API_BASE = _isDev ? "/api" : `${_rawBase || "http://localhost:8000"}/api`;
+
+if (!_isDev && !_rawBase && typeof console !== "undefined") {
+  // eslint-disable-next-line no-console
+  console.warn("[PIXLS] Set REACT_APP_BACKEND_URL for production builds.");
+}
 
 const withAuth = (token) =>
   token

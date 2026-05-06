@@ -10,7 +10,7 @@ import zipfile
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from groq import Groq
 
@@ -33,6 +33,8 @@ from PyPDF2 import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from starlette.middleware.cors import CORSMiddleware
+
+from services.resume_classifier import compute_category_alignment, load_resume_classifier, predict_resume_category
 
 
 ROOT_DIR = Path(__file__).parent
@@ -362,38 +364,17 @@ class ATSScore(BaseModel):
     suggestions: List[str] = Field(default_factory=list)
 
 
-class BiasFlags(BaseModel):
-    gender_skew_detected: bool = False
-    university_bias_detected: bool = False
-    flags: List[str] = Field(default_factory=list)
-    diversity_note: str = ""
-
-
-class CareerTrajectory(BaseModel):
-    score: int = 0
-    label: str = "Stable"
-    notes: List[str] = Field(default_factory=list)
-
-
-class TrustScore(BaseModel):
-    score: int = 100
-    label: str = "High"
-    badge: str = "🟢"
-    flags: List[str] = Field(default_factory=list)
+class VerificationCheck(BaseModel):
+    name: str
+    passed: bool
+    detail: str
 
 
 class VerificationSummary(BaseModel):
-    score: int = 0
+    status: str = "verified_partially"
     checks_passed: int = 0
     checks_total: int = 5
-    checks: List[str] = Field(default_factory=list)
-    status: str = "Review Required"
-    badge_color: str = "red"
-
-
-class InterviewQuestions(BaseModel):
-    questions: List[str] = Field(default_factory=list)
-    generated_by: str = "rule-based"
+    checks: List[VerificationCheck] = Field(default_factory=list)
 
 
 class EmailTemplates(BaseModel):
@@ -402,9 +383,25 @@ class EmailTemplates(BaseModel):
     body: str = ""
 
 
-class ResumeAdvice(BaseModel):
-    advice: List[str] = Field(default_factory=list)
-    priority_fix: str = ""
+class GitHubAnalysisSummary(BaseModel):
+    username: str = ""
+    top_project: str = ""
+    stack_coverage_pct: float = 0.0
+    activity_status: str = "Unknown"
+
+
+class LinkedInSummary(BaseModel):
+    verified: bool = False
+    headline: str = ""
+    notes: str = ""
+
+
+class ScannedLinksSummary(BaseModel):
+    total_links: int = 0
+    reachable_links: int = 0
+    github_found: bool = False
+    linkedin_found: bool = False
+    portfolio_reachable: bool = False
 
 
 class NotableAchievement(BaseModel):
@@ -442,16 +439,20 @@ class CandidateResult(BaseModel):
     verified_links: VerifiedLinks
     github_extraction_method: str = "rule-based"
     ats_score: ATSScore = Field(default_factory=ATSScore)
-    bias_flags: BiasFlags = Field(default_factory=BiasFlags)
-    career_trajectory: CareerTrajectory = Field(default_factory=CareerTrajectory)
-    trust_score: TrustScore = Field(default_factory=TrustScore)
     verification_summary: VerificationSummary = Field(
         default_factory=VerificationSummary
     )
-    interview_questions: InterviewQuestions = Field(default_factory=InterviewQuestions)
+    evidence_summary: str = ""
+    shortlist_recommendation: Literal["Advance", "Review", "Hold"] = "Review"
+    github_analysis_summary: GitHubAnalysisSummary = Field(default_factory=GitHubAnalysisSummary)
+    linkedin_summary: LinkedInSummary = Field(default_factory=LinkedInSummary)
+    scanned_links_summary: ScannedLinksSummary = Field(default_factory=ScannedLinksSummary)
     email_template: EmailTemplates = Field(default_factory=EmailTemplates)
-    resume_advice: ResumeAdvice = Field(default_factory=ResumeAdvice)
     notable_achievements: NotableAchievements = Field(default_factory=NotableAchievements)
+    predicted_category: Optional[str] = None
+    category_confidence: float = 0.0
+    category_alignment_score: int = 0
+    category_alignment_label: str = ""
 
 
 class SkillCoverage(BaseModel):
@@ -472,6 +473,7 @@ class AnalysisAnalytics(BaseModel):
     score_distribution: Dict[str, int]
     skill_coverage: List[SkillCoverage] = Field(default_factory=list)
     candidate_scores: List[CandidateScore] = Field(default_factory=list)
+    category_distribution: Dict[str, int] = Field(default_factory=dict)
 
 
 class AnalysisResponse(BaseModel):
@@ -604,7 +606,8 @@ def create_access_token(subject_email: str, remember_me: bool = True) -> str:
     if remember_me:
         lifetime_minutes = JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 24 * 7
     expire = datetime.now(timezone.utc) + timedelta(minutes=lifetime_minutes)
-    payload = {"sub": subject_email.lower(), "exp": expire}
+    # Numeric exp (Unix seconds) — required for reliable decode across python-jose / clients
+    payload = {"sub": subject_email.lower(), "exp": int(expire.timestamp())}
     return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
 
@@ -1553,6 +1556,61 @@ def verify_linkedin_portfolio(
             notes=f"LinkedIn URL verified · authwall blocked scraper · {cookie_hint}",
         )
 
+    def _build_linkedin_cookie_header() -> str:
+        """
+        Best-effort cookie header for LinkedIn HTML fetch.
+        Note: This does not guarantee bypassing authwall, but improves success for
+        self-hosted demos where the user provides their own session cookies.
+        """
+        parts: List[str] = []
+        if LINKEDIN_LI_AT:
+            parts.append(f"li_at={LINKEDIN_LI_AT}")
+        if LINKEDIN_JSESSIONID:
+            jsessionid = LINKEDIN_JSESSIONID.strip('"')
+            # LinkedIn expects quotes in the cookie value for JSESSIONID
+            if not jsessionid.startswith('"'):
+                jsessionid = f'"{jsessionid}"'
+            parts.append(f"JSESSIONID={jsessionid}")
+        return "; ".join(parts)
+
+    def _extract_public_profile_signals(html: str) -> Dict[str, Any]:
+        """
+        Extract usable signals from a LinkedIn HTML page without relying on brittle selectors.
+        """
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Prefer OpenGraph/meta signals when present.
+        def _meta(prop: str) -> str:
+            tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+            return normalize_text(tag.get("content", "")) if tag else ""
+
+        og_title = _meta("og:title")
+        og_desc = _meta("og:description") or _meta("description")
+
+        page_title = normalize_text(soup.title.text) if soup.title else ""
+        headline = og_desc or og_title or page_title
+
+        # Attempt JSON-LD (often present on public pages)
+        full_name = ""
+        try:
+            for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
+                raw = (s.string or "").strip()
+                if not raw:
+                    continue
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    full_name = full_name or (data.get("name") or "")
+        except Exception:
+            pass
+
+        text_blob = normalize_text(soup.get_text(" ", strip=True)).lower()
+        return {
+            "page_title": page_title,
+            "headline": headline,
+            "full_name": normalize_text(full_name) if full_name else "",
+            "text_blob": text_blob,
+        }
+
     # ── Layer 2: Public HTML scrape (best-effort) ─────────────────────────────
     li_headers = {
         **_BROWSER_HEADERS,
@@ -1562,19 +1620,20 @@ def verify_linkedin_portfolio(
         "sec-fetch-site": "cross-site",
     }
     try:
+        cookie_header = _build_linkedin_cookie_header()
+        if cookie_header:
+            li_headers["Cookie"] = cookie_header
+
         response = requests.get(url, headers=li_headers, timeout=5, allow_redirects=True)
         final_url = str(response.url)
         blocked = (
-            response.status_code not in range(200, 400)
-            and response.status_code not in {403, 429, 999}
-        ) or any(k in final_url for k in ("authwall", "/login", "checkpoint"))
+            response.status_code in {401, 999}
+            or any(k in final_url for k in ("authwall", "/login", "checkpoint", "uas/login"))
+        )
 
         if not blocked:
-            soup = BeautifulSoup(response.text, "html.parser")
-            page_title = normalize_text(soup.title.text) if soup.title else ""
-            meta_desc = soup.find("meta", attrs={"name": "description"})
-            description = normalize_text(meta_desc.get("content", "")) if meta_desc else ""
-            text_blob = normalize_text(soup.get_text(" ", strip=True)).lower()
+            signals = _extract_public_profile_signals(response.text)
+            text_blob = signals["text_blob"]
 
             jd_terms = sorted(set([*jd_required_skills, *jd_nice_to_have]))
             jd_keywords_found = [t for t in jd_terms if t.lower() in text_blob]
@@ -1587,17 +1646,22 @@ def verify_linkedin_portfolio(
             if projects_found > 0:      score += 8
             if connections_count >= 500: score += 5
 
+            cookie_note = (
+                "✅ Fetched with cookies (li_at/JSESSIONID)"
+                if cookie_header
+                else "⚠️ Fetched without cookies (public/partial)"
+            )
             return LinkedInPortfolioAnalysis(
                 verified=True,
                 profile_url=url,
-                headline=description or page_title,
-                current_title=page_title,
+                headline=signals.get("headline", ""),
+                current_title=signals.get("page_title", ""),
                 total_experience_years=total_experience_years,
                 projects_found=projects_found,
                 jd_keywords_found=jd_keywords_found,
                 connections_count=connections_count,
                 verification_score=round(score, 2),
-                notes="LinkedIn public page (partial data — add PROXYCURL_API_KEY for full profile)",
+                notes=f"LinkedIn HTML parsed ({cookie_note}) — add PROXYCURL_API_KEY for full profile",
             )
     except Exception as exc:
         logger.debug("LinkedIn public fetch failed for %s: %s", url, exc)
@@ -1617,19 +1681,28 @@ def verify_linkedin_portfolio(
     )
 
 
-def github_api_get_json(endpoint: str) -> Dict[str, Any]:
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "PIXLS-resume-screener/1.0",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+def github_api_get_json(endpoint: str, *, _retry_without_token: bool = True) -> Dict[str, Any]:
+    """
+    Lightweight GitHub REST wrapper.
+
+    Important: if a configured GITHUB_TOKEN is invalid/expired, we automatically retry once
+    without auth so repo scanning still works (with lower rate limits) instead of hard-failing.
+    """
+
+    def _build_headers(include_auth: bool) -> Dict[str, str]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "PIXLS-resume-screener/1.0",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if include_auth and GITHUB_TOKEN:
+            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+        return headers
 
     try:
         response = requests.get(
             f"https://api.github.com{endpoint}",
-            headers=headers,
+            headers=_build_headers(include_auth=True),
             timeout=10,
         )
     except Exception as exc:
@@ -1652,8 +1725,30 @@ def github_api_get_json(endpoint: str) -> Dict[str, Any]:
         return {"ok": False, "status_code": 403, "data": None, "error": msg}
 
     if response.status_code == 401:
-        logger.warning("GitHub API: bad credentials (token invalid or expired)")
-        return {"ok": False, "status_code": 401, "data": None, "error": "bad_credentials"}
+        # If we *have* a token configured, treat this as "token bad" and retry once without it.
+        if GITHUB_TOKEN and _retry_without_token:
+            logger.warning(
+                "GitHub API: bad credentials (token invalid/expired). Retrying without token."
+            )
+            try:
+                response = requests.get(
+                    f"https://api.github.com{endpoint}",
+                    headers=_build_headers(include_auth=False),
+                    timeout=10,
+                )
+            except Exception as exc:
+                return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
+
+            if response.status_code == 401:
+                return {
+                    "ok": False,
+                    "status_code": 401,
+                    "data": None,
+                    "error": "bad_credentials",
+                }
+        else:
+            logger.warning("GitHub API: bad credentials (token invalid or expired)")
+            return {"ok": False, "status_code": 401, "data": None, "error": "bad_credentials"}
 
     if response.status_code >= 400:
         return {"ok": False, "status_code": response.status_code, "data": None}
@@ -2377,191 +2472,25 @@ def compute_ats_score(text: str, file_bytes: Optional[bytes] = None, filename: s
     return ATSScore(score=score, label=label, issues=issues, suggestions=suggestions)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FEATURE 2 — BIAS & FAIRNESS MONITOR
-# ─────────────────────────────────────────────────────────────────────────────
-
-_PRESTIGE_BIAS_UNIVERSITIES = [
-    "iit", "iim", "mit", "stanford", "harvard", "oxford", "cambridge",
-    "nit", "bits pilani", "vit",
-]
-_GENDER_FEMALE_NAMES = {
-    "alice", "mary", "emma", "sophia", "olivia", "ava", "isabella", "mia",
-    "anjali", "priya", "divya", "sneha", "pooja", "ananya", "lakshmi",
-    "fatima", "sara", "aisha", "nadia", "maria",
-}
-_GENDER_MALE_NAMES = {
-    "james", "john", "robert", "michael", "william", "david", "joseph",
-    "rahul", "amit", "arun", "arjun", "vikram", "rajesh", "suresh",
-    "mohammed", "ali", "omar", "carlos", "diego",
-}
-
-
-def compute_bias_flags(candidate_name: str, text: str) -> BiasFlags:
-    flags: List[str] = []
+def evaluate_timeline_consistency(text: str) -> Dict[str, Any]:
     text_lower = text.lower()
-    first_name = candidate_name.split()[0].lower() if candidate_name else ""
-
-    gender_skew = False
-    if first_name in _GENDER_FEMALE_NAMES:
-        flags.append("Name may trigger unconscious gender bias — blind review recommended")
-        gender_skew = True
-    elif first_name in _GENDER_MALE_NAMES:
-        flags.append("Name detected — consider anonymising for first-pass screening")
-
-    uni_bias = False
-    for uni in _PRESTIGE_BIAS_UNIVERSITIES:
-        if uni in text_lower:
-            flags.append(f"Prestige-university bias risk ({uni.upper()} detected) — evaluate skills independently")
-            uni_bias = True
-            break
-
-    diversity_note = ""
-    if gender_skew or uni_bias:
-        diversity_note = "Bias signals detected. Consider anonymised shortlisting for fairness."
-    else:
-        diversity_note = "No strong bias signals detected in this candidate profile."
-
-    return BiasFlags(
-        gender_skew_detected=gender_skew,
-        university_bias_detected=uni_bias,
-        flags=flags,
-        diversity_note=diversity_note,
+    grad_years = re.findall(
+        r"(?:graduated|batch|passed out|class of)\s*[:\-]?\s*(20\d{2}|19\d{2})",
+        text_lower,
     )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FEATURE 4 — CAREER TRAJECTORY SCORING
-# ─────────────────────────────────────────────────────────────────────────────
-
-_ROLE_LEVELS: Dict[str, int] = {
-    "intern": 1, "trainee": 1, "apprentice": 1,
-    "junior": 2, "associate": 3,
-    "mid-level": 4, "mid level": 4,
-    "senior": 5, "lead": 6, "principal": 7, "staff": 7,
-    "manager": 8, "director": 9, "vp": 10, "cto": 10, "ceo": 10,
-}
-
-
-def compute_career_trajectory(text: str, years_experience: int) -> CareerTrajectory:
-    text_lower = text.lower()
-    notes: List[str] = []
-    score = 0
-
-    found_levels = [(label, lvl) for label, lvl in _ROLE_LEVELS.items() if label in text_lower]
-    if len(found_levels) >= 2:
-        sorted_levels = sorted(found_levels, key=lambda x: x[1])
-        lowest, highest = sorted_levels[0], sorted_levels[-1]
-        delta = highest[1] - lowest[1]
-        if delta >= 3:
-            score += 30
-            notes.append(f"{lowest[0].title()} → {highest[0].title()} progression (+30%)")
-        elif delta >= 1:
-            score += 15
-            notes.append(f"{lowest[0].title()} → {highest[0].title()} growth (+15%)")
-    elif found_levels:
-        notes.append(f"Role level: {found_levels[0][0].title()}")
-
-    has_frontend = any(kw in text_lower for kw in ["react", "vue", "angular", "html", "css", "frontend"])
-    has_backend = any(kw in text_lower for kw in ["python", "node", "java", "django", "fastapi", "backend"])
-    if has_frontend and has_backend:
-        score += 22
-        notes.append("Frontend → Fullstack breadth detected (+22%)")
-
-    has_ml = any(kw in text_lower for kw in ["machine learning", "deep learning", "tensorflow", "pytorch", "nlp"])
-    has_eng = any(kw in text_lower for kw in ["python", "java", "c++", "software engineer"])
-    if has_ml and has_eng:
-        score += 18
-        notes.append("Engineering + ML/AI skill fusion (+18%)")
-
-    if years_experience >= 5:
-        score += 15
-        notes.append(f"{years_experience}+ years of experience (+15%)")
-    elif years_experience >= 2:
-        score += 8
-        notes.append(f"{years_experience} years experience (+8%)")
-
-    long_tenure_pattern = re.findall(r"(\d{4})\s*[-–]\s*(?:present|current|\d{4})", text_lower)
-    if long_tenure_pattern:
-        try:
-            durations = []
-            for match in re.finditer(r"(\d{4})\s*[-–]\s*(present|current|(\d{4}))", text_lower):
-                start = int(match.group(1))
-                end = 2025 if match.group(2) in ("present", "current") else int(match.group(3))
-                durations.append(end - start)
-            if durations and max(durations) >= 3:
-                notes.append(f"Stable long-term tenure detected ({max(durations)}yr max)")
-        except Exception:
-            pass
-
-    score = max(0, min(100, score))
-    label = "Rising" if score >= 60 else "Stable" if score >= 30 else "Early"
-    return CareerTrajectory(score=score, label=label, notes=notes)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FEATURE 5 — FAKE EXPERIENCE DETECTOR
-# ─────────────────────────────────────────────────────────────────────────────
-
-_BUZZWORDS_TRUST = [
-    "innovative", "synergy", "leverage", "paradigm", "proactive", "go-getter",
-    "results-driven", "detail-oriented", "thought leader", "dynamic", "passionate",
-    "guru", "ninja", "rockstar", "wizard", "disrupting", "revolutionary",
-]
-
-
-def compute_trust_score(
-    text: str,
-    years_experience: int,
-    github_analysis: GitHubPortfolioAnalysis,
-) -> TrustScore:
-    score = 100
-    flags: List[str] = []
-    text_lower = text.lower()
-    words = text_lower.split()
-    word_count = max(len(words), 1)
-
-    # Buzzword ratio check
-    buzz_count = sum(1 for bw in _BUZZWORDS_TRUST if bw in text_lower)
-    buzz_ratio = buzz_count / word_count * 100
-    if buzz_ratio > 5:
-        score -= 8
-        flags.append(f"High buzzword ratio ({buzz_ratio:.1f}%) — substance unclear")
-
-    # GitHub mismatch: claims skills but no repos
-    claimed_tech = [s for s in ["python", "java", "react", "node", "docker"] if s in text_lower]
-    if claimed_tech and github_analysis.verified and github_analysis.total_public_repos == 0:
-        score -= 15
-        flags.append(f"Claims {claimed_tech[0].title()} but GitHub has 0 public repos")
-
-    # Inflated experience: junior role but claims 5+ years
-    is_junior_role = any(kw in text_lower for kw in ["intern", "trainee", "junior"])
-    if is_junior_role and years_experience >= 5:
-        score -= 10
-        flags.append(f"Junior role indicators with {years_experience}yr experience claim — verify dates")
-
-    # Graduation vs work timeline check
-    grad_years = re.findall(r"(?:graduated|batch|passed out|class of)\s*[:\-]?\s*(20\d{2}|19\d{2})", text_lower)
     work_years = re.findall(r"(20\d{2})\s*[-–]\s*(?:present|current)", text_lower)
     if grad_years and work_years:
         try:
             grad_year = max(int(y) for y in grad_years)
             work_start = min(int(y) for y in work_years)
             if work_start < grad_year - 1:
-                score -= 12
-                flags.append(f"Work start ({work_start}) before graduation ({grad_year}) — timeline inconsistency")
+                return {
+                    "passed": False,
+                    "detail": f"Potential mismatch: work start {work_start}, graduation {grad_year}",
+                }
         except Exception:
             pass
-
-    # Very short resume is suspicious
-    if word_count < 100:
-        score -= 10
-        flags.append("Very short resume — key details may be missing")
-
-    score = max(0, min(100, score))
-    label = "High" if score >= 80 else "Medium" if score >= 60 else "Low"
-    badge = "🟢" if score >= 80 else "🟡" if score >= 60 else "🔴"
-    return TrustScore(score=score, label=label, badge=badge, flags=flags)
+    return {"passed": True, "detail": "No mismatch detected"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2738,266 +2667,86 @@ def analyze_notable_achievements(
     return NotableAchievements(top_achievements=achievements, total_found=len(scored))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FEATURE 5b — VERIFICATION SCORE  (5-check, 100-pt algorithm)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def calculate_verification_summary(
     resume_text: str,
-    matched_skills: List[str],
     github_analysis: "GitHubPortfolioAnalysis",
     linkedin_analysis: "LinkedInPortfolioAnalysis",
-    candidate_years: int,
+    scanned_links: List["LinkScanResult"],
+    portfolio_reachable: bool,
 ) -> "VerificationSummary":
-    """
-    5-check verification algorithm:
-
-    CHECK 1 – GitHub Activity        (25 pts)
-    CHECK 2 – LinkedIn Verification  (25 pts)
-    CHECK 3 – Timeline Consistency   (20 pts)
-    CHECK 4 – Skills-Projects Match  (20 pts)
-    CHECK 5 – Red-Flags / Buzzwords  (10 pts)
-    """
-    score = 0
-    checks: List[str] = []
-    text_lower = resume_text.lower()
-
-    # ── Check 1: GitHub Activity (25 pts) ──
-    if github_analysis.verified:
-        status = github_analysis.activity_status
-        if status == "Active":
-            score += 25
-            checks.append(
-                f"✅ GitHub: {github_analysis.total_public_repos} repos "
-                f"(active commits)"
-            )
-        elif status == "Recent":
-            score += 15
-            checks.append(
-                f"⚠️ GitHub: {github_analysis.total_public_repos} repos "
-                f"(recent, some inactivity)"
-            )
-        else:
-            checks.append(
-                f"❌ GitHub: {github_analysis.total_public_repos} repos "
-                f"(stale 6+ months)"
-            )
+    timeline = evaluate_timeline_consistency(resume_text)
+    checks = [
+        VerificationCheck(
+            name="GitHub linked",
+            passed=bool(github_analysis.verified and github_analysis.username),
+            detail=github_analysis.profile_url or "No GitHub profile detected",
+        ),
+        VerificationCheck(
+            name="LinkedIn linked",
+            passed=bool(linkedin_analysis.verified and linkedin_analysis.profile_url),
+            detail=linkedin_analysis.profile_url or "No LinkedIn profile detected",
+        ),
+        VerificationCheck(
+            name="Portfolio reachable",
+            passed=portfolio_reachable,
+            detail="Reachable" if portfolio_reachable else "Not reachable",
+        ),
+        VerificationCheck(
+            name="Links scanned",
+            passed=len(scanned_links) > 0,
+            detail=f"{len(scanned_links)} link(s) scanned",
+        ),
+        VerificationCheck(
+            name="Timeline consistency",
+            passed=bool(timeline["passed"]),
+            detail=str(timeline["detail"]),
+        ),
+    ]
+    checks_passed = sum(1 for c in checks if c.passed)
+    if checks_passed >= 4:
+        status = "verified_high"
+    elif checks_passed >= 2:
+        status = "verified_partially"
     else:
-        checks.append("❌ GitHub: No verified profile detected")
-
-    # ── Check 2: LinkedIn Verification (25 pts) ──
-    if linkedin_analysis.verified:
-        score += 25
-        headline = linkedin_analysis.headline or "profile found"
-        checks.append(f"✅ LinkedIn: {headline[:60]}")
-    else:
-        checks.append("❌ LinkedIn: Not verified (blocked or missing)")
-
-    # ── Check 3: Timeline Consistency (20 pts) ──
-    grad_years = re.findall(
-        r"(?:graduated|batch|passed out|class of)\s*[:\-]?\s*(20\d{2}|19\d{2})",
-        text_lower,
-    )
-    work_years = re.findall(r"(20\d{2})\s*[-–]\s*(?:present|current)", text_lower)
-    timeline_ok = True
-    if grad_years and work_years:
-        try:
-            grad_year = max(int(y) for y in grad_years)
-            work_start = min(int(y) for y in work_years)
-            if work_start < grad_year - 1:
-                timeline_ok = False
-                checks.append(
-                    f"❌ Timeline: Work started ({work_start}) before graduation "
-                    f"({grad_year}) — inconsistency"
-                )
-        except Exception:
-            pass
-    if timeline_ok:
-        score += 20
-        checks.append("✅ Timeline: Dates are logically consistent")
-
-    # ── Check 4: Skills-Projects Match (20 pts) ──
-    jd_tech_in_github = github_analysis.jd_relevant_projects if github_analysis.verified else 0
-    if jd_tech_in_github >= 2:
-        score += 20
-        checks.append(
-            f"✅ Skills: {jd_tech_in_github} JD-relevant repos found"
-        )
-    elif jd_tech_in_github == 1:
-        score += 10
-        checks.append("⚠️ Skills: Only 1 JD-relevant repo found")
-    elif matched_skills:
-        score += 5
-        checks.append(
-            f"⚠️ Skills: Resume claims {len(matched_skills)} matches "
-            f"but no repos to verify"
-        )
-    else:
-        checks.append("❌ Skills: No JD-matching repos or skill claims found")
-
-    # ── Check 5: Red Flags / Buzzwords (10 pts) ──
-    words = text_lower.split()
-    word_count = max(len(words), 1)
-    buzz_count = sum(1 for bw in _BUZZWORDS_TRUST if bw in text_lower)
-    buzz_ratio = buzz_count / word_count * 100
-    if buzz_ratio < 5:
-        score += 10
-        checks.append(f"✅ Red Flags: None detected (buzzword ratio {buzz_ratio:.1f}%)")
-    else:
-        checks.append(
-            f"❌ Red Flags: High buzzword ratio ({buzz_ratio:.1f}%) — substance unclear"
-        )
-
-    score = max(0, min(100, score))
-    checks_passed = sum(1 for c in checks if c.startswith("✅"))
-    status = (
-        "Fully Verified" if score >= 90
-        else "Mostly Verified" if score >= 70
-        else "Partially Verified" if score >= 50
-        else "Review Required"
-    )
-    badge_color = (
-        "green" if score >= 90
-        else "yellow" if score >= 70
-        else "orange" if score >= 50
-        else "red"
-    )
-
+        status = "verification_risk"
     return VerificationSummary(
-        score=score,
-        checks_passed=checks_passed,
-        checks_total=5,
-        checks=checks,
         status=status,
-        badge_color=badge_color,
+        checks_passed=checks_passed,
+        checks_total=len(checks),
+        checks=checks,
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FEATURE 6 — AUTO INTERVIEW QUESTIONS
-# ─────────────────────────────────────────────────────────────────────────────
-
-_STATIC_QUESTIONS: Dict[str, List[str]] = {
-    "python": [
-        "Explain the difference between lists and tuples in Python.",
-        "How does Python's GIL affect multi-threading?",
-        "Describe a time you used generators or decorators in production.",
-    ],
-    "react": [
-        "What is the difference between controlled and uncontrolled components?",
-        "Explain the useEffect cleanup pattern with an example.",
-        "How do you optimise a React app that renders slowly?",
-    ],
-    "docker": [
-        "Walk me through a multi-stage Docker build you have written.",
-        "How do you handle secrets in Docker containers securely?",
-        "Describe the difference between CMD and ENTRYPOINT.",
-    ],
-    "machine learning": [
-        "How do you handle class imbalance in a classification problem?",
-        "Explain bias-variance tradeoff with a real example from your work.",
-        "Which feature selection strategies have you used and why?",
-    ],
-    "sql": [
-        "Write a query to find the second-highest salary in a table.",
-        "Explain the difference between INNER JOIN and LEFT JOIN.",
-        "How would you optimise a slow-running query?",
-    ],
-    "aws": [
-        "What is the difference between S3 and EBS storage?",
-        "How do you architect a highly available service on AWS?",
-        "Describe your experience with IAM roles and policies.",
-    ],
-    "kubernetes": [
-        "Explain the difference between a Deployment and a StatefulSet.",
-        "How do you roll back a broken Kubernetes deployment?",
-        "What is a liveness probe and when would you use it?",
-    ],
-    "node": [
-        "How does the Node.js event loop work?",
-        "Explain the difference between Promise.all and Promise.allSettled.",
-        "How do you manage memory leaks in a Node.js service?",
-    ],
-    "java": [
-        "What is the difference between HashMap and ConcurrentHashMap?",
-        "Explain the Java memory model and garbage collection.",
-        "How do you use streams and lambdas for collection processing?",
-    ],
-    "typescript": [
-        "What are the benefits of using TypeScript over JavaScript?",
-        "Explain generics in TypeScript with a practical example.",
-        "How do you handle strict null checks in TypeScript?",
-    ],
-}
-
-_GENERIC_QUESTIONS = [
-    "Describe the most technically complex project in your portfolio.",
-    "How do you approach debugging a production issue at 2 AM?",
-    "Walk me through your git workflow in a team environment.",
-    "How do you stay current with new technologies in your field?",
-    "Describe a situation where you had to refactor legacy code.",
-]
+def determine_shortlist_recommendation(
+    fit_score: float,
+    missing_skills: List[str],
+    verification_summary: VerificationSummary,
+) -> Literal["Advance", "Review", "Hold"]:
+    if fit_score >= 80 and len(missing_skills) <= 1 and verification_summary.checks_passed >= 4:
+        return "Advance"
+    if fit_score < 60 or len(missing_skills) >= 4 or verification_summary.checks_passed <= 1:
+        return "Hold"
+    return "Review"
 
 
-def generate_interview_questions(
-    candidate_name: str,
+def build_evidence_summary(
     matched_skills: List[str],
-    jd_text: str,
-) -> InterviewQuestions:
-    questions: List[str] = []
-    generated_by = "rule-based"
-
-    # Pull skill-specific questions (up to 2 per skill, max 3 skills)
-    used_skills = 0
-    for skill in matched_skills:
-        if used_skills >= 3:
-            break
-        skill_lower = skill.lower()
-        for key, qs in _STATIC_QUESTIONS.items():
-            if key in skill_lower or skill_lower in key:
-                questions.extend(qs[:2])
-                used_skills += 1
-                break
-
-    # Pad with generic questions up to 8 total
-    for q in _GENERIC_QUESTIONS:
-        if len(questions) >= 8:
-            break
-        if q not in questions:
-            questions.append(q)
-
-    # Try Groq for enhanced questions if available
-    if _groq_client and matched_skills:
-        try:
-            skills_str = ", ".join(matched_skills[:5])
-            response = _groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"Generate 5 precise technical interview questions for a candidate named {candidate_name} "
-                        f"who has skills in: {skills_str}.\n"
-                        "Make questions specific, practical, and senior-level.\n"
-                        "Return a JSON object: {\"questions\": [\"Q1\", \"Q2\", ...]}\n"
-                        "Return ONLY valid JSON, no explanation."
-                    ),
-                }],
-                temperature=0.4,
-                max_tokens=400,
-            )
-            raw = (response.choices[0].message.content or "").strip()
-            json_match = re.search(r"\{.*?\}", raw, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-                llm_qs = data.get("questions", [])
-                if isinstance(llm_qs, list) and llm_qs:
-                    questions = [str(q) for q in llm_qs[:5]] + questions[5:]
-                    generated_by = "llm-groq"
-                    LLM_STATS["total_calls"] += 1
-        except Exception as exc:
-            logger.warning("Groq interview questions failed: %s", exc)
-
-    return InterviewQuestions(questions=questions[:8], generated_by=generated_by)
+    missing_skills: List[str],
+    github_analysis: GitHubPortfolioAnalysis,
+    linkedin_analysis: LinkedInPortfolioAnalysis,
+) -> str:
+    parts: List[str] = []
+    if matched_skills:
+        parts.append(f"Matched skills: {', '.join(matched_skills[:4])}")
+    if missing_skills:
+        parts.append(f"Missing: {', '.join(missing_skills[:3])}")
+    if github_analysis.verified:
+        parts.append(
+            f"GitHub verified ({github_analysis.jd_relevant_projects} JD-relevant project(s), {github_analysis.activity_status.lower()} activity)"
+        )
+    if linkedin_analysis.verified:
+        parts.append("LinkedIn profile verified")
+    return " | ".join(parts) if parts else "Limited evidence available from resume and links"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3051,52 +2800,6 @@ def generate_email_template(
     return EmailTemplates(template_type=template_type, subject=subject, body=body)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FEATURE 8 — RESUME IMPROVEMENT ADVISOR
-# ─────────────────────────────────────────────────────────────────────────────
-
-def generate_resume_advice(
-    ats: ATSScore,
-    trust: TrustScore,
-    career: CareerTrajectory,
-    matched_skills: List[str],
-    missing_skills: List[str],
-    github_analysis: GitHubPortfolioAnalysis,
-    fit_score: float,
-) -> ResumeAdvice:
-    advice: List[str] = []
-
-    # ATS fixes first (highest ROI)
-    for suggestion in ats.suggestions[:2]:
-        advice.append(suggestion)
-
-    # Trust issues
-    for flag in trust.flags[:1]:
-        advice.append(f"Review: {flag}")
-
-    # Missing skills
-    if missing_skills:
-        top_missing = missing_skills[:3]
-        advice.append(f"Add these missing skills to your resume: {', '.join(s.title() for s in top_missing)}")
-
-    # GitHub
-    if not github_analysis.verified:
-        advice.append("Link an active GitHub profile — adds up to +15 fit score points")
-    elif github_analysis.jd_relevant_projects == 0:
-        advice.append("Pin JD-relevant repositories on GitHub for stronger portfolio evidence")
-    elif github_analysis.best_project_complexity < 5:
-        advice.append("Add README files and tests to your top GitHub projects to boost complexity score")
-
-    # Career progression
-    if career.score < 30 and career.label == "Early":
-        advice.append("Include internships, side projects, or open-source contributions to show progression")
-
-    # Generic if nothing else
-    if not advice:
-        advice.append("Profile is well-aligned with the JD. Maintain active GitHub contributions.")
-
-    priority_fix = advice[0] if advice else "No critical fixes needed."
-    return ResumeAdvice(advice=advice[:6], priority_fix=priority_fix)
 
 
 def build_analytics(results: List[CandidateResult], required_skills: List[str]) -> AnalysisAnalytics:
@@ -3108,6 +2811,7 @@ def build_analytics(results: List[CandidateResult], required_skills: List[str]) 
             score_distribution={"top": 0, "middle": 0, "low": 0},
             skill_coverage=[],
             candidate_scores=[],
+            category_distribution={},
         )
 
     fit_scores = [candidate.fit_score for candidate in results]
@@ -3131,6 +2835,12 @@ def build_analytics(results: List[CandidateResult], required_skills: List[str]) 
         for result in results
     ]
 
+    category_distribution: Dict[str, int] = {}
+    for r in results:
+        if getattr(r, "predicted_category", None):
+            key = str(r.predicted_category)
+            category_distribution[key] = category_distribution.get(key, 0) + 1
+
     return AnalysisAnalytics(
         resumes_uploaded=len(results),
         average_fit_score=round(sum(fit_scores) / len(fit_scores), 2),
@@ -3138,7 +2848,34 @@ def build_analytics(results: List[CandidateResult], required_skills: List[str]) 
         score_distribution=distribution,
         skill_coverage=skill_coverage,
         candidate_scores=candidate_scores,
+        category_distribution=category_distribution,
     )
+
+
+def extract_jd_target_role(jd_text: str) -> str:
+    """
+    Lightweight heuristic for a JD target role label.
+    Used only for the classifier alignment signal (small weight).
+    """
+    text = (jd_text or "").lower()
+    role_patterns = [
+        ("backend developer", [r"backend developer", r"backend engineer", r"python developer", r"api developer"]),
+        ("frontend developer", [r"frontend developer", r"front[-\\s]?end developer", r"react developer", r"ui engineer"]),
+        ("full stack developer", [r"full stack", r"fullstack"]),
+        ("data scientist", [r"data scientist", r"machine learning engineer", r"ml engineer"]),
+        ("devops engineer", [r"devops", r"site reliability", r"sre"]),
+        ("mobile developer", [r"android developer", r"ios developer", r"mobile developer"]),
+    ]
+    for label, pats in role_patterns:
+        for pat in pats:
+            if re.search(pat, text):
+                return label.title()
+    # Fallback: first 6 words after "hiring" / "looking for"
+    m = re.search(r"(hiring|looking for|seeking)\\s+([a-zA-Z\\s]{3,80})", jd_text or "", re.IGNORECASE)
+    if m:
+        words = re.sub(r"\\s+", " ", m.group(2)).strip().split(" ")[:6]
+        return " ".join(words).strip().title()
+    return ""
 
 
 @api_router.get("/")
@@ -3268,8 +3005,13 @@ async def perform_analysis(
         "Job description parsed",
         "Running TF-IDF similarity and weighted scoring",
         "Running Smart Portfolio Verifier for GitHub and LinkedIn",
+        "Applying ML resume role classifier (supporting signal)",
         "Preparing ranking dashboard payload",
     ]
+
+    # Load classifier once per server session (safe if missing)
+    load_resume_classifier()
+    jd_target_role = extract_jd_target_role(final_jd_text)
 
     required_skills = extract_required_skills(final_jd_text)
     nice_to_have_skills = extract_nice_to_have_skills(final_jd_text)
@@ -3323,6 +3065,26 @@ async def perform_analysis(
     async def _process_one_resume(index: int, resume: dict) -> CandidateResult:
         async with _sem:
             resume_text_lower = resume["text"].lower()
+
+            # ── ML resume category prediction (supporting signal) ─────────────
+            predicted_category = None
+            category_confidence = 0.0
+            category_alignment_score = 0
+            category_alignment_label = ""
+            try:
+                pred = predict_resume_category(resume["text"])
+                if pred:
+                    predicted_category = pred.get("predicted_category")
+                    category_confidence = float(pred.get("confidence") or 0.0)
+                    alignment = compute_category_alignment(
+                        predicted_category=predicted_category,
+                        jd_target_role=jd_target_role,
+                        confidence=category_confidence,
+                    )
+                    category_alignment_score = int(alignment.get("alignment_score") or 0)
+                    category_alignment_label = str(alignment.get("alignment_label") or "")
+            except Exception as exc:
+                logger.warning("Category prediction failed (non-fatal): %s", exc)
 
             matched_skills = [s for s in required_skills if s in resume_text_lower]
             missing_skills  = [s for s in required_skills if s not in resume_text_lower]
@@ -3393,13 +3155,20 @@ async def perform_analysis(
             activity_bonus = round(min(65.0, activity_bonus), 2)
 
             similarity_score = round(float(similarity_scores[index] * 100), 2)
+
+            # Category alignment: small bounded bonus (max ~6 points)
+            category_boost = 0.0
+            if category_alignment_score > 0 and category_confidence > 0:
+                category_boost = round((category_alignment_score / 10.0) * 6.0, 2)
+
             fit_score = round(
                 min(100.0,
                     0.45 * similarity_score
                     + 0.30 * skills_match_score
                     + 0.15 * experience_match_score
                     + 0.10 * education_match_score
-                    + activity_bonus),
+                    + activity_bonus
+                    + category_boost),
                 2,
             )
 
@@ -3416,19 +3185,46 @@ async def perform_analysis(
             resume_file_bytes = resume.get("file_bytes")
             resume_filename   = resume.get("source_file", "")
 
-            # ── Pure-CPU features — run concurrently in threads ───────────────
-            ats_t  = asyncio.to_thread(compute_ats_score, resume["text"], resume_file_bytes, resume_filename)
-            bias_t = asyncio.to_thread(compute_bias_flags, resume["candidate_name"], resume["text"])
-            car_t  = asyncio.to_thread(compute_career_trajectory, resume["text"], candidate_years)
-            tru_t  = asyncio.to_thread(compute_trust_score, resume["text"], candidate_years, github_analysis)
-
-            ats, bias, career, trust = await asyncio.gather(ats_t, bias_t, car_t, tru_t)
+            ats = await asyncio.to_thread(compute_ats_score, resume["text"], resume_file_bytes, resume_filename)
 
             achievements = analyze_notable_achievements(resume["text"], github_analysis, linkedin_analysis)
-            verification = calculate_verification_summary(resume["text"], matched_skills, github_analysis, linkedin_analysis, candidate_years)
-            interview_qs = generate_interview_questions(resume["candidate_name"], matched_skills, final_jd_text)
+            verification = calculate_verification_summary(
+                resume["text"],
+                github_analysis,
+                linkedin_analysis,
+                scanned_links,
+                portfolio_reachable,
+            )
+            shortlist_recommendation = determine_shortlist_recommendation(
+                fit_score,
+                missing_skills,
+                verification,
+            )
+            evidence_summary = build_evidence_summary(
+                matched_skills,
+                missing_skills,
+                github_analysis,
+                linkedin_analysis,
+            )
             email_tpl    = generate_email_template(resume["candidate_name"], fit_score, matched_skills, missing_skills, github_activity.username)
-            advice       = generate_resume_advice(ats, trust, career, matched_skills, missing_skills, github_analysis, fit_score)
+            scanned_links_summary = ScannedLinksSummary(
+                total_links=len(scanned_links),
+                reachable_links=len([link for link in scanned_links if link.reachable]),
+                github_found=bool(github_url),
+                linkedin_found=bool(linkedin_url),
+                portfolio_reachable=portfolio_reachable,
+            )
+            github_analysis_summary = GitHubAnalysisSummary(
+                username=str(github_analysis.username or ""),
+                top_project=str(github_analysis.top_projects[0].repo_name) if github_analysis.top_projects else "",
+                stack_coverage_pct=float(github_analysis.stack_coverage_pct or 0.0),
+                activity_status=str(github_analysis.activity_status or "Unknown"),
+            )
+            linkedin_summary = LinkedInSummary(
+                verified=linkedin_analysis.verified,
+                headline=linkedin_analysis.headline or "",
+                notes=linkedin_analysis.notes or "",
+            )
 
             return CandidateResult(
                 candidate_id=str(uuid.uuid4()),
@@ -3447,14 +3243,14 @@ async def perform_analysis(
                 extracted_years_experience=candidate_years,
                 github_extraction_method=resume.get("github_extraction_method", "rule-based"),
                 ats_score=ats,
-                bias_flags=bias,
-                career_trajectory=career,
-                trust_score=trust,
                 verification_summary=verification,
+                evidence_summary=evidence_summary,
+                shortlist_recommendation=shortlist_recommendation,
+                github_analysis_summary=github_analysis_summary,
+                linkedin_summary=linkedin_summary,
+                scanned_links_summary=scanned_links_summary,
                 notable_achievements=achievements,
-                interview_questions=interview_qs,
                 email_template=email_tpl,
-                resume_advice=advice,
                 verified_links=VerifiedLinks(
                     github_url=github_url,
                     linkedin_url=linkedin_url,
@@ -3472,6 +3268,10 @@ async def perform_analysis(
                     portfolio_reachable=portfolio_reachable,
                     activity_bonus=round(activity_bonus, 2),
                 ),
+                predicted_category=predicted_category,
+                category_confidence=round(float(category_confidence), 4),
+                category_alignment_score=category_alignment_score,
+                category_alignment_label=category_alignment_label,
             )
 
     # ── Run all resumes in parallel ────────────────────────────────────────────
@@ -3479,6 +3279,9 @@ async def perform_analysis(
         *[_process_one_resume(i, r) for i, r in enumerate(resume_documents)],
         return_exceptions=True,
     )
+    for idx, raw in enumerate(results_raw):
+        if isinstance(raw, Exception):
+            logger.warning("Candidate processing failed at index %s: %s", idx, raw)
     results: List[CandidateResult] = [r for r in results_raw if isinstance(r, CandidateResult)]
 
     results.sort(key=lambda item: item.fit_score, reverse=True)
@@ -3762,12 +3565,16 @@ async def export_results_csv(
                 "source_file": candidate.get("source_file"),
                 "fit_score": candidate.get("fit_score"),
                 "tier": candidate.get("tier"),
+                "shortlist_recommendation": candidate.get("shortlist_recommendation", "Review"),
                 "similarity_score": candidate.get("similarity_score"),
                 "skills_match_score": candidate.get("skills_match_score"),
                 "experience_match_score": candidate.get("experience_match_score"),
                 "education_match_score": candidate.get("education_match_score"),
+                "evidence_summary": candidate.get("evidence_summary", ""),
                 "matched_skills": ", ".join(candidate.get("matched_skills", [])),
                 "missing_skills": ", ".join(candidate.get("missing_skills", [])),
+                "verification_status": candidate.get("verification_summary", {}).get("status", ""),
+                "verification_checks_passed": candidate.get("verification_summary", {}).get("checks_passed", 0),
                 "github_username": candidate.get("verified_links", {})
                 .get("github", {})
                 .get("username"),
@@ -3793,6 +3600,10 @@ async def export_results_csv(
                 .get("github_analysis", {})
                 .get("best_project_complexity"),
                 "activity_bonus": candidate.get("verified_links", {}).get("activity_bonus"),
+                "predicted_category": candidate.get("predicted_category"),
+                "category_confidence": candidate.get("category_confidence", 0.0),
+                "category_alignment_score": candidate.get("category_alignment_score", 0),
+                "category_alignment_label": candidate.get("category_alignment_label", ""),
             }
         )
 

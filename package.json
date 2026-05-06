@@ -1,0 +1,11 @@
+{
+  "name": "projectscreener",
+  "private": true,
+  "description": "PIXLS resume screener — run frontend/backend from repo root",
+  "scripts": {
+    "start": "npm start --prefix frontend",
+    "start:frontend": "npm start --prefix frontend",
+    "start:backend": "cd backend && ../.venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000 --reload",
+    "install:all": "npm install --prefix frontend"
+  }
+}

@@ -20,6 +20,7 @@ import { getHeatmap, getResults } from "../services/api";
 import { useAuth } from "../context/AuthContext";
 
 const tierPieColors = ["#eb6a45", "#f39a6b", "#d94833"];
+const categoryBarColors = ["#0ea5e9", "#22c55e", "#f59e0b", "#a855f7", "#ef4444", "#64748b"];
 
 export default function AnalyticsPage() {
   const { batchId: routeBatchId } = useParams();
@@ -84,29 +85,35 @@ export default function AnalyticsPage() {
     return { green, orange, red, avg };
   }, [analysis]);
 
-  const trustStats = useMemo(() => {
-    if (!analysis?.results?.length) return { high: 0, medium: 0, low: 0, avg: 0 };
-    const results = analysis.results;
-    const high = results.filter((r) => r.trust_score?.label === "High").length;
-    const medium = results.filter((r) => r.trust_score?.label === "Medium").length;
-    const low = results.filter((r) => r.trust_score?.label === "Low").length;
-    const avg = Math.round(results.reduce((s, r) => s + (r.trust_score?.score ?? 100), 0) / results.length);
-    return { high, medium, low, avg };
+  const verificationCoverage = useMemo(() => {
+    if (!analysis?.results?.length) return { mostlyVerified: 0, partialOrRisk: 0 };
+    const mostlyVerified = analysis.results.filter((r) => (r.verification_summary?.checks_passed ?? 0) >= 4).length;
+    return {
+      mostlyVerified,
+      partialOrRisk: analysis.results.length - mostlyVerified,
+    };
   }, [analysis]);
 
-  const biasCount = useMemo(() => {
-    if (!analysis?.results?.length) return 0;
-    return analysis.results.filter((r) => r.bias_flags?.gender_skew_detected || r.bias_flags?.university_bias_detected).length;
-  }, [analysis]);
-
-  const careerData = useMemo(() => {
-    if (!analysis?.results?.length) return [];
-    return analysis.results.slice(0, 10).map((r) => ({
-      name: r.candidate_name.split(" ")[0],
-      career: r.career_trajectory?.score ?? 0,
-      trust: r.trust_score?.score ?? 0,
-      ats: r.ats_score?.score ?? 100,
-    }));
+  const categoryDistribution = useMemo(() => {
+    const dist = analysis?.analytics?.category_distribution;
+    if (dist && typeof dist === "object") {
+      return Object.entries(dist)
+        .map(([name, value]) => ({ name, value: Number(value) || 0 }))
+        .filter((x) => x.value > 0)
+        .sort((a, b) => b.value - a.value)
+        .slice(0, 12);
+    }
+    // Back-compat: compute from results if analytics field missing
+    const counts = {};
+    (analysis?.results || []).forEach((r) => {
+      const k = r?.predicted_category;
+      if (!k) return;
+      counts[k] = (counts[k] || 0) + 1;
+    });
+    return Object.entries(counts)
+      .map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 12);
   }, [analysis]);
 
   if (!batchId) {
@@ -236,6 +243,32 @@ export default function AnalyticsPage() {
         </Card>
       </div>
 
+      {/* ── NEW: Category distribution ── */}
+      {categoryDistribution.length > 0 && (
+        <Card className="premium-card border-none" data-testid="category-distribution-card">
+          <CardHeader>
+            <CardTitle className="text-xl" data-testid="category-distribution-title">
+              Predicted Role Distribution
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="h-[320px]" data-testid="category-distribution-chart-wrap">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={categoryDistribution}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" />
+                <XAxis dataKey="name" tick={{ fontSize: 11 }} interval={0} angle={-18} height={70} textAnchor="end" />
+                <YAxis allowDecimals={false} tick={{ fontSize: 11 }} />
+                <Tooltip />
+                <Bar dataKey="value" radius={[8, 8, 0, 0]}>
+                  {categoryDistribution.map((entry, index) => (
+                    <Cell key={entry.name} fill={categoryBarColors[index % categoryBarColors.length]} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+      )}
+
       <Card className="premium-card border-none" data-testid="skill-coverage-card">
         <CardHeader>
           <CardTitle className="text-xl" data-testid="skill-coverage-title">
@@ -252,35 +285,12 @@ export default function AnalyticsPage() {
         </CardContent>
       </Card>
 
-      {/* ── NEW: ATS + Trust + Bias KPIs ── */}
+      {/* ── Recruiter-focused quality KPIs ── */}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4" data-testid="advanced-kpi-grid">
         <KpiCard title="Avg ATS Score" value={`${atsStats.avg}%`} helper={`✅ ${atsStats.green} green · ⚠️ ${atsStats.orange} orange · ❌ ${atsStats.red} red`} testId="kpi-ats-avg" />
-        <KpiCard title="Avg Trust Score" value={`${trustStats.avg}%`} helper={`🟢 ${trustStats.high} high · 🟡 ${trustStats.medium} med · 🔴 ${trustStats.low} low`} testId="kpi-trust-avg" />
-        <KpiCard title="Bias Signals" value={biasCount} helper="Candidates with potential bias flags" testId="kpi-bias-count" />
+        <KpiCard title="Verification Coverage" value={verificationCoverage.mostlyVerified} helper={`${verificationCoverage.partialOrRisk} partial/risk`} testId="kpi-verification-coverage" />
         <KpiCard title="LLM Enhanced" value={analysis.llm_tech_stack_enhanced ? "Yes" : "No"} helper="Groq Llama 3.1 70B tech stack extraction" testId="kpi-llm-enhanced" />
       </div>
-
-      {/* ── NEW: Career / Trust / ATS multi-bar chart ── */}
-      {careerData.length > 0 && (
-        <Card className="premium-card border-none" data-testid="career-trust-chart-card">
-          <CardHeader>
-            <CardTitle className="text-xl">Career · Trust · ATS Scores per Candidate</CardTitle>
-          </CardHeader>
-          <CardContent className="h-[320px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={careerData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" />
-                <XAxis dataKey="name" tick={{ fontSize: 11 }} />
-                <YAxis domain={[0, 100]} tick={{ fontSize: 11 }} />
-                <Tooltip />
-                <Bar dataKey="career" name="Career" fill="#8b5cf6" radius={[4, 4, 0, 0]} />
-                <Bar dataKey="trust" name="Trust" fill="#10b981" radius={[4, 4, 0, 0]} />
-                <Bar dataKey="ats" name="ATS" fill="#eb6a45" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-      )}
 
       {/* ── NEW: Skill Heatmap ── */}
       {heatmap && heatmap.skills.length > 0 && (
@@ -321,27 +331,6 @@ export default function AnalyticsPage() {
         </Card>
       )}
 
-      {/* ── NEW: Bias & Fairness summary ── */}
-      {analysis.results.some((r) => r.bias_flags?.flags?.length) && (
-        <Card className="premium-card border-none" data-testid="bias-monitor-card">
-          <CardHeader>
-            <CardTitle className="text-xl">Bias & Fairness Monitor</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            {analysis.results
-              .filter((r) => r.bias_flags?.flags?.length)
-              .map((r) => (
-                <div key={r.candidate_id} className="rounded-md border border-purple-200 bg-purple-50 p-3">
-                  <p className="text-xs font-semibold text-purple-800">{r.candidate_name}</p>
-                  {r.bias_flags.flags.map((f, i) => (
-                    <p key={i} className="text-xs text-purple-700">{f}</p>
-                  ))}
-                  <p className="mt-1 text-[11px] italic text-purple-500">{r.bias_flags.diversity_note}</p>
-                </div>
-              ))}
-          </CardContent>
-        </Card>
-      )}
     </section>
   );
 }

@@ -73,8 +73,17 @@ export default function AuthPage() {
       const nextRoute = location.state?.from || "/dashboard";
       navigate(nextRoute, { replace: true });
     } catch (error) {
-      const message = error?.response?.data?.detail || "Unable to continue authentication.";
-      toast.error(message);
+      const status = error?.response?.status;
+      const detail = error?.response?.data?.detail;
+      const isNetwork = !error?.response && error?.message;
+      let message = detail || "Unable to continue authentication.";
+      if (isNetwork) {
+        message =
+          "Cannot reach the API server. Start the backend (port 8000) and refresh, or open the app at http://localhost:3000.";
+      } else if (status === 401) {
+        message = detail || "Invalid email or password.";
+      }
+      toast.error(typeof message === "string" ? message : "Authentication failed.");
     } finally {
       setIsSubmitting(false);
     }

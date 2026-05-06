@@ -25,6 +25,33 @@ API_BASE = f"{BASE_URL}/api"
 @pytest.fixture(scope="session")
 def api_client():
     session = requests.Session()
+    # Authenticate once per test session so protected screener endpoints work.
+    unique_id = str(uuid.uuid4())[:8]
+    email = f"recruiter_{unique_id}@example.com"
+    password = "SecurePass@123"
+
+    signup = session.post(
+        f"{API_BASE}/auth/recruiters/signup",
+        json={
+            "name": "Test Recruiter",
+            "email": email,
+            "company": "Acme Hiring",
+            "role": "Talent Acquisition",
+            "password": password,
+            "confirm_password": password,
+        },
+        timeout=60,
+    )
+    assert signup.status_code == 200, signup.text
+
+    login = session.post(
+        f"{API_BASE}/auth/recruiters/login",
+        json={"email": email, "password": password, "remember_me": True},
+        timeout=60,
+    )
+    assert login.status_code == 200, login.text
+    token = login.json()["access_token"]
+    session.headers.update({"Authorization": f"Bearer {token}"})
     return session
 
 
