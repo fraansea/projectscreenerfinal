@@ -11,6 +11,7 @@ import UploadPage from "./pages/UploadPage";
 import ProcessingPage from "./pages/ProcessingPage";
 import ResultsPage from "./pages/ResultsPage";
 import AnalyticsPage from "./pages/AnalyticsPage";
+import EvaluationPage from "./pages/EvaluationPage";
 
 export default function App() {
   return (
@@ -34,6 +35,7 @@ export default function App() {
               <Route path="processing/:batchId" element={<ProcessingPage />} />
               <Route path="results/:batchId" element={<ResultsPage />} />
               <Route path="analytics/:batchId" element={<AnalyticsPage />} />
+              <Route path="evaluation/:batchId" element={<EvaluationPage />} />
             </Route>
 
             <Route path="/" element={<Navigate to="/login" replace />} />

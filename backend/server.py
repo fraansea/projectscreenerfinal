@@ -35,6 +35,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from starlette.middleware.cors import CORSMiddleware
 
 from services.resume_classifier import compute_category_alignment, load_resume_classifier, predict_resume_category
+from services.ranking_metrics import compute_ranking_metrics
 
 
 ROOT_DIR = Path(__file__).parent
@@ -63,6 +64,7 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 PROXYCURL_API_KEY = os.environ.get("PROXYCURL_API_KEY", "")
 LINKEDIN_LI_AT = os.environ.get("LINKEDIN_LI_AT", "")
 LINKEDIN_JSESSIONID = os.environ.get("LINKEDIN_JSESSIONID", "")
+LINKEDIN_SCRAPER_ENABLED = os.environ.get("PIXLS_LINKEDIN_SCRAPER_ENABLED", "").lower() in {"1", "true", "yes"}
 GITHUB_CLIENT = (
     Github(auth=Auth.Token(GITHUB_TOKEN), per_page=20)
     if GITHUB_TOKEN
@@ -474,6 +476,26 @@ class AnalysisAnalytics(BaseModel):
     skill_coverage: List[SkillCoverage] = Field(default_factory=list)
     candidate_scores: List[CandidateScore] = Field(default_factory=list)
     category_distribution: Dict[str, int] = Field(default_factory=dict)
+
+
+class CandidateLabelRequest(BaseModel):
+    batch_id: str
+    candidate_id: str
+    label: int = Field(..., ge=0, le=3)
+
+
+class CandidateLabelResponse(BaseModel):
+    batch_id: str
+    candidate_id: str
+    label: int
+    updated_at: str
+
+
+class BatchEvaluationResponse(BaseModel):
+    batch_id: str
+    metrics: Dict[str, float]
+    labeled_candidates: int
+    note: str = ""
 
 
 class AnalysisResponse(BaseModel):
@@ -1507,12 +1529,112 @@ def _playwright_data_to_analysis(
     )
 
 
+def _linkedin_scraper_fetch_profile(url: str) -> Optional[Dict[str, Any]]:
+    """
+    joeyism/linkedin_scraper integration (pip: linkedin-scraper).
+
+    Notes:
+    - This library still typically needs a logged-in session to avoid authwall.
+    - We reuse LINKEDIN_LI_AT/JSESSIONID if present; otherwise it may return partial/no data.
+    - Returns a best-effort dict or None.
+    """
+    if not LINKEDIN_SCRAPER_ENABLED:
+        return None
+
+    try:
+        # Newer versions are async/playwright-based.
+        # Import guarded so backend works without the dependency.
+        from linkedin_scraper import Person, actions  # type: ignore
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except Exception as exc:
+        logger.debug("linkedin-scraper not available: %s", exc)
+        return None
+
+    if not url:
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+            )
+
+            # Try to inject cookies if provided
+            cookies = []
+            if LINKEDIN_LI_AT:
+                cookies.append(
+                    {
+                        "name": "li_at",
+                        "value": LINKEDIN_LI_AT,
+                        "domain": ".linkedin.com",
+                        "path": "/",
+                        "httpOnly": True,
+                        "secure": True,
+                    }
+                )
+            if LINKEDIN_JSESSIONID:
+                jsessionid = LINKEDIN_JSESSIONID.strip('"')
+                cookies.append(
+                    {
+                        "name": "JSESSIONID",
+                        "value": f"\"{jsessionid}\"",
+                        "domain": ".linkedin.com",
+                        "path": "/",
+                        "httpOnly": False,
+                        "secure": True,
+                    }
+                )
+            if cookies:
+                context.add_cookies(cookies)
+
+            page = context.new_page()
+            page.set_default_timeout(8000)
+
+            # If we don't have cookies, the library's login flow won't work.
+            # We still attempt to load the profile; it may fail/redirect.
+            try:
+                # actions.login() requires email/pass; we do not support storing credentials.
+                # So we rely on cookies when available.
+                pass
+            except Exception:
+                pass
+
+            person = Person(url, page=page)
+            data = {
+                "profile_url": url,
+                "full_name": getattr(person, "name", "") or "",
+                "headline": getattr(person, "headline", "") or "",
+                "experiences": [{"title": e.title} for e in (getattr(person, "experiences", []) or [])[:5] if getattr(e, "title", "")],
+                "educations": [{"degree": getattr(ed, "degree", "")} for ed in (getattr(person, "educations", []) or [])[:3]],
+                "skills": [s for s in (getattr(person, "skills", []) or [])[:20] if s],
+                "_page_text": (page.inner_text("body") or "") if page else "",
+            }
+
+            context.close()
+            browser.close()
+            if data.get("full_name") or data.get("headline") or data.get("skills"):
+                logger.info("linkedin-scraper fetched profile for %s", url)
+                return data
+            return None
+    except Exception as exc:
+        logger.debug("linkedin-scraper fetch failed for %s: %s", url, exc)
+        return None
+
+
 def verify_linkedin_portfolio(
     url: Optional[str], jd_required_skills: List[str], jd_nice_to_have: List[str]
 ) -> LinkedInPortfolioAnalysis:
     """
     3-layer LinkedIn verification pipeline:
       Layer 1: Proxycurl API  — real structured data (requires PROXYCURL_API_KEY)
+      Layer 1.2: linkedin-scraper (joeyism) — best-effort (cookies help)
+      Layer 1.5: Playwright browser scraper — best-effort (cookies help)
       Layer 2: Public HTML    — limited data from public page (often blocked by LinkedIn)
       Layer 3: Format check   — URL validity only, recruiter clicks to review manually
     """
@@ -1528,6 +1650,14 @@ def verify_linkedin_portfolio(
         return _proxycurl_to_linkedin_analysis(
             proxycurl_data, url, jd_required_skills, jd_nice_to_have
         )
+
+    # ── Layer 1.2: joeyism/linkedin_scraper (pip: linkedin-scraper) ───────────
+    try:
+        ls_data = _linkedin_scraper_fetch_profile(url)
+    except Exception:
+        ls_data = None
+    if ls_data:
+        return _playwright_data_to_analysis(ls_data, url, jd_required_skills, jd_nice_to_have)
 
     # ── Layer 1.5: Playwright browser scraper ────────────────────────────────
     try:
@@ -1905,14 +2035,143 @@ def verify_github_portfolio(
             "github_analysis": GitHubPortfolioAnalysis(**cached["github_analysis"]),
         }
 
+    def _scrape_github_profile_and_repos() -> Optional[Dict[str, Any]]:
+        """
+        Scrapy-based HTML scraping fallback (no GitHub API usage).
+        Uses scrapy.Selector for parsing, but performs plain HTTP GETs.
+        """
+        try:
+            from scrapy import Selector  # type: ignore
+        except Exception:
+            return None
+
+        try:
+            headers = {**_BROWSER_HEADERS, "Accept": "text/html"}
+            prof = requests.get(f"https://github.com/{username}", headers=headers, timeout=10)
+            if prof.status_code >= 400:
+                return None
+            sel = Selector(text=prof.text)
+            repo_count_text = sel.css("a.UnderlineNav-item[href$='?tab=repositories'] span.Counter::text").get()
+            repo_count = int((repo_count_text or "0").replace(",", "").strip() or "0")
+
+            # List repos (public HTML) from repositories tab
+            repos_page = requests.get(
+                f"https://github.com/{username}?tab=repositories",
+                headers=headers,
+                timeout=10,
+            )
+            if repos_page.status_code >= 400:
+                return {"repo_count": repo_count, "repos": []}
+            rs = Selector(text=repos_page.text)
+            repo_items = rs.css("li[itemprop='owns']")[: max(1, GITHUB_REPO_ANALYZE_LIMIT)]
+            repos: List[Dict[str, Any]] = []
+            for it in repo_items:
+                name = (it.css("a[itemprop='name codeRepository']::text").get() or "").strip()
+                if not name:
+                    continue
+                desc = (it.css("p[itemprop='description']::text").get() or "").strip()
+                lang = (it.css("[itemprop='programmingLanguage']::text").get() or "").strip()
+                stars = (it.css("a[href$='stargazers']::text").get() or "0").strip()
+                forks = (it.css("a[href$='forks']::text").get() or "0").strip()
+
+                def _to_int(v: str) -> int:
+                    v = (v or "").strip().replace(",", "")
+                    return int(v) if v.isdigit() else 0
+
+                repos.append(
+                    {
+                        "name": name,
+                        "description": desc,
+                        "topics": [],
+                        "size": 0,
+                        "html_url": f"https://github.com/{username}/{name}",
+                        "stargazers_count": _to_int(stars),
+                        "forks_count": _to_int(forks),
+                        "pushed_at": None,
+                        "fork": False,
+                        # We'll treat detected primary language as "languages" later
+                        "_primary_language": lang,
+                    }
+                )
+            return {"repo_count": repo_count, "repos": repos}
+        except Exception:
+            return None
+
     profile_payload = github_api_get_json(f"/users/{username}")
     if not profile_payload.get("ok"):
+        # If tokenless/rate-limited, attempt HTML scrape fallback.
+        scraped = _scrape_github_profile_and_repos()
+        if scraped:
+            repos_data = scraped.get("repos", [])
+            analyzed_projects: List[ProjectVerification] = []
+            for repo_data in repos_data:
+                try:
+                    analyzed_projects.append(
+                        analyze_github_repository(
+                            owner=username,
+                            repo_data=repo_data,
+                            jd_required_skills=jd_required_skills,
+                            jd_nice_to_have=jd_nice_to_have,
+                        )
+                    )
+                except Exception:
+                    continue
+
+            analyzed_projects.sort(
+                key=lambda item: (item.jd_stack_coverage_pct, item.complexity_score), reverse=True
+            )
+            top_projects = analyzed_projects[:3]
+            stack_coverage_pct = round(
+                sum([project.jd_stack_coverage_pct for project in analyzed_projects]) / max(1, len(analyzed_projects)),
+                2,
+            )
+            best_complexity = round(
+                max([project.complexity_score for project in analyzed_projects], default=0.0), 2
+            )
+            activity_status = (
+                "Active"
+                if any(project.activity_status == "Active" for project in analyzed_projects)
+                else "Recent"
+                if any(project.activity_status == "Recent" for project in analyzed_projects)
+                else "Stale"
+            )
+
+            github_activity = GitHubActivity(
+                valid=True,
+                username=username,
+                repo_count=int(scraped.get("repo_count") or 0),
+                last_active=None,
+                top_languages=[],
+                bonus_points=0.0,
+                notes="GitHub scraped via HTML (Scrapy selector) — API unavailable",
+            )
+            github_analysis = GitHubPortfolioAnalysis(
+                verified=True,
+                profile_url=github_url,
+                username=username,
+                total_public_repos=int(scraped.get("repo_count") or 0),
+                repos_analyzed=len(analyzed_projects),
+                jd_relevant_projects=len([p for p in analyzed_projects if p.jd_stack_coverage_pct >= 20]),
+                stack_coverage_pct=stack_coverage_pct,
+                best_project_complexity=best_complexity,
+                activity_status=activity_status,
+                verification_score=5.0,
+                top_projects=top_projects,
+                notes="GitHub analysis from HTML scrape (limited signals, no README/languages API)",
+            )
+
+            payload = {
+                "github_activity": github_activity.model_dump(),
+                "github_analysis": github_analysis.model_dump(),
+            }
+            set_github_cache(cache_key, payload)
+            return {"github_activity": github_activity, "github_analysis": github_analysis}
+
         err = profile_payload.get("error", "")
         if err == "rate_limit_exceeded":
             note = (
                 "GitHub API rate limit exceeded (60 req/hr unauthenticated). "
-                "Add GITHUB_TOKEN to backend/.env for 5000 req/hr — "
-                "generate one at https://github.com/settings/tokens"
+                "Set GITHUB_TOKEN in backend/.env for 5000 req/hr."
             )
         elif err == "bad_credentials":
             note = "GitHub token invalid or expired — update GITHUB_TOKEN in backend/.env"
@@ -3540,6 +3799,104 @@ async def get_llm_stats():
         "total_llm_calls": LLM_STATS["total_calls"],
         "note": "Groq is used only when rule-based extraction fails (5% edge cases). Free tier: 1M tokens/day.",
     }
+
+
+@api_router.post("/screener/labels", response_model=CandidateLabelResponse)
+async def set_candidate_label(
+    payload: CandidateLabelRequest,
+    current_recruiter: RecruiterProfile = Depends(get_current_recruiter),
+):
+    """Store recruiter outcome label (0..3) for a candidate within a batch."""
+    doc = await db.screener_batches.find_one(
+        {"batch_id": payload.batch_id}, {"_id": 0, "batch_id": 1, "recruiter_id": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    _check_batch_ownership(doc, current_recruiter.recruiter_id)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.screener_candidate_labels.update_one(
+        {
+            "batch_id": payload.batch_id,
+            "candidate_id": payload.candidate_id,
+            "recruiter_id": current_recruiter.recruiter_id,
+        },
+        {
+            "$set": {
+                "batch_id": payload.batch_id,
+                "candidate_id": payload.candidate_id,
+                "label": int(payload.label),
+                "recruiter_id": current_recruiter.recruiter_id,
+                "updated_at": now_iso,
+            },
+            "$setOnInsert": {"created_at": now_iso},
+        },
+        upsert=True,
+    )
+
+    return CandidateLabelResponse(
+        batch_id=payload.batch_id,
+        candidate_id=payload.candidate_id,
+        label=int(payload.label),
+        updated_at=now_iso,
+    )
+
+
+@api_router.get("/screener/eval/{batch_id}", response_model=BatchEvaluationResponse)
+async def evaluate_batch_ranking(
+    batch_id: str,
+    current_recruiter: RecruiterProfile = Depends(get_current_recruiter),
+):
+    """Compute ranking-quality metrics for a batch using stored labels."""
+    doc = await db.screener_batches.find_one(
+        {"batch_id": batch_id}, {"_id": 0, "results": 1, "recruiter_id": 1, "batch_id": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    _check_batch_ownership(doc, current_recruiter.recruiter_id)
+
+    results = doc.get("results", []) or []
+    ranked_ids = [str(c.get("candidate_id")) for c in results if c.get("candidate_id")]
+
+    cursor = db.screener_candidate_labels.find(
+        {"batch_id": batch_id, "recruiter_id": current_recruiter.recruiter_id},
+        {"_id": 0, "candidate_id": 1, "label": 1},
+    )
+    raw = await cursor.to_list(length=5000)
+    labels = {str(r["candidate_id"]): int(r.get("label", 0)) for r in raw if r.get("candidate_id")}
+
+    labeled_count = len(labels)
+    if labeled_count == 0:
+        return BatchEvaluationResponse(
+            batch_id=batch_id,
+            metrics={
+                "precision@5": 0.0,
+                "precision@10": 0.0,
+                "recall@10": 0.0,
+                "map": 0.0,
+                "mrr": 0.0,
+                "ndcg@10": 0.0,
+                "agreement": 0.0,
+            },
+            labeled_candidates=0,
+            note="No labels found for this batch yet. Label candidates (0-3) to compute ranking metrics.",
+        )
+
+    m = compute_ranking_metrics(ranked_ids, labels)
+    return BatchEvaluationResponse(
+        batch_id=batch_id,
+        metrics={
+            "precision@5": m.precision_at_5,
+            "precision@10": m.precision_at_10,
+            "recall@10": m.recall_at_10,
+            "map": m.map,
+            "mrr": m.mrr,
+            "ndcg@10": m.ndcg_at_10,
+            "agreement": m.agreement_score,
+        },
+        labeled_candidates=labeled_count,
+        note="Relevance threshold is label>=2 for precision/recall/MAP/MRR; nDCG uses graded labels 0..3.",
+    )
 
 
 @api_router.get("/screener/export/{batch_id}")

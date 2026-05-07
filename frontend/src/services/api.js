@@ -106,6 +106,22 @@ export const getHeatmap = async (batchId, token) => {
   return data;
 };
 
+export const setCandidateLabel = async ({ batchId, candidateId, label, token }) => {
+  const { data } = await axios.post(
+    `${API_BASE}/screener/labels`,
+    { batch_id: batchId, candidate_id: candidateId, label },
+    { headers: withAuth(token) }
+  );
+  return data;
+};
+
+export const getBatchEvaluation = async (batchId, token) => {
+  const { data } = await axios.get(`${API_BASE}/screener/eval/${batchId}`, {
+    headers: withAuth(token),
+  });
+  return data;
+};
+
 export const getScreeningBatches = async (token) => {
   const { data } = await axios.get(`${API_BASE}/screener/batches`, {
     headers: withAuth(token),

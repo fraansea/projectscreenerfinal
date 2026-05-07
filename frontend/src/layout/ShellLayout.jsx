@@ -1,4 +1,4 @@
-import { BarChart3, FileSearch, Home, LoaderCircle, LogOut, Menu, Plus, Search } from "lucide-react";
+import { BarChart3, FileSearch, Gauge, Home, LoaderCircle, LogOut, Menu, Plus, Search } from "lucide-react";
 import { useEffect, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
@@ -100,6 +100,14 @@ export const ShellLayout = () => {
               data-testid="nav-analytics-link"
             >
               <BarChart3 size={16} /> Analytics
+            </NavLink>
+
+            <NavLink
+              to={batchId ? `/evaluation/${batchId}` : "/upload"}
+              className={navStyles}
+              data-testid="nav-evaluation-link"
+            >
+              <Gauge size={16} /> Evaluation
             </NavLink>
 
             <button
